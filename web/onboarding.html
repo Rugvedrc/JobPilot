@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FresherPilot · Set up</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/account.css" />
+  </head>
+  <body>
+    <main class="setup">
+      <header class="brand"><span class="logo" aria-hidden="true">JF</span>
+        <div><h1>Set up your job search</h1><p class="tagline">Three steps, about two minutes</p></div></header>
+
+      <section class="panel step" id="step1">
+        <h2><span class="num">1</span> Your API keys</h2>
+        <p class="muted small">Searches and AI checks run on your own free accounts, so nobody else's credits are used. Keys are stored encrypted with your password.</p>
+        <label class="field">Groq API key (required) <a href="https://console.groq.com/keys" target="_blank" rel="noopener">get one free</a>
+          <input id="GROQ_API_KEY" type="password" autocomplete="off" placeholder="gsk_…" /></label>
+        <label class="field">Apify API token (required for job searches) <a href="https://console.apify.com/settings/integrations" target="_blank" rel="noopener">get one free</a>
+          <input id="APIFY_API_KEY" type="password" autocomplete="off" placeholder="apify_api_…" /></label>
+        <details><summary class="link-btn">Optional: Gmail sending</summary>
+          <label class="field">Gmail address<input id="GMAIL_ADDRESS" autocomplete="off" /></label>
+          <label class="field">Gmail app password <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">create</a>
+            <input id="GMAIL_APP_PASSWORD" type="password" autocomplete="off" /></label>
+        </details>
+        <div class="row"><button class="btn primary" id="saveKeys">Save keys</button><span class="small" id="keysMsg"></span></div>
+      </section>
+
+      <section class="panel step" id="step2">
+        <h2><span class="num">2</span> Your resume</h2>
+        <label class="field">Resume (PDF)<input type="file" id="resume" accept="application/pdf" /></label>
+        <label class="field">…or tell us about yourself (skills, degree, what jobs you want)
+          <textarea id="about" rows="5" placeholder="e.g. 2026 B.Tech CSE graduate, Java + Spring Boot, built 3 projects, looking for backend developer jobs"></textarea></label>
+        <div class="row"><button class="btn primary" id="analyse">Read my resume</button><span class="small" id="analyseMsg"></span></div>
+      </section>
+
+      <section class="panel step" id="step3" hidden>
+        <h2><span class="num">3</span> Check what we found</h2>
+        <p class="muted small">This decides which jobs are searched and which are shown to you. Edit anything; lists are comma-separated.</p>
+        <div class="grid2">
+          <label class="field">Full name<input id="full_name" /></label>
+          <label class="field">Email<input id="email" /></label>
+          <label class="field">Phone<input id="phone" /></label>
+          <label class="field">City<input id="city" /></label>
+        </div>
+        <label class="field">Who you are (used in messages)<input id="headline" /></label>
+        <label class="field">Summary (the AI matches jobs against this)<textarea id="summary" rows="2"></textarea></label>
+        <label class="field">Jobs that fit you<input id="target_area" /></label>
+        <div class="grid2">
+          <label class="field">Years of full-time experience<input id="experience_years" type="number" min="0" step="0.5" /></label>
+          <label class="field">Hide jobs asking for this many years or more<input id="reject_from_years" type="number" min="1" step="1" /></label>
+        </div>
+        <label class="field">Skills<textarea id="skills" rows="3"></textarea></label>
+        <label class="field">Job titles to search (Naukri / Indeed / Internshala)<textarea id="roles" rows="2"></textarea></label>
+        <label class="field">LinkedIn searches (up to 6; each costs Apify credit)<input id="linkedin_titles" /></label>
+        <label class="field">Technologies you DON'T work with (jobs with these in the title are skipped for free)<textarea id="off_stack" rows="2"></textarea></label>
+        <div class="row"><button class="btn primary" id="finish">Save and find jobs</button><span class="small" id="finishMsg"></span></div>
+      </section>
+    </main>
+    <script src="/static/account.js"></script>
+    <script>
+      let draft = null;
+      const LISTS = ["skills", "roles", "linkedin_titles", "off_stack"];
+      $("analyse").onclick = async () => {
+        const fd = new FormData();
+        const f = $("resume").files[0];
+        if (f) fd.append("file", f);
+        fd.append("about", $("about").value);
+        if (!f && !$("about").value.trim()) return msg("analyseMsg", "Upload a PDF or write a few lines.", true);
+        msg("analyseMsg", "Reading your resume… (about 20 seconds)");
+        $("analyse").disabled = true;
+        try {
+          const res = await fetch("/api/onboarding/resume", { method: "POST", body: fd });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Couldn't read the resume");
+          draft = data;
+          const p = data.profile.personal, s = data.prefs;
+          for (const k of ["full_name", "email", "phone", "city"]) $(k).value = p[k] || "";
+          for (const k of ["headline", "summary", "target_area", "experience_years", "reject_from_years"]) $(k).value = s[k] ?? "";
+          for (const k of LISTS) $(k).value = (s[k] || []).map((x) => x.trim()).join(", ");
+          $("step3").hidden = false;
+          $("step3").scrollIntoView({ behavior: "smooth" });
+          msg("analyseMsg", "Done ✓");
+        } catch (err) {
+          msg("analyseMsg", err.message, true);
+        } finally {
+          $("analyse").disabled = false;
+        }
+      };
+      $("finish").onclick = async () => {
+        const prefs = { ...draft.prefs };
+        for (const k of ["headline", "summary", "target_area"]) prefs[k] = $(k).value.trim();
+        prefs.experience_years = Number($("experience_years").value || 0);
+        prefs.reject_from_years = Math.max(1, Number($("reject_from_years").value || 1));
+        for (const k of LISTS) prefs[k] = $(k).value.split(",").map((x) => x.trim()).filter(Boolean);
+        prefs.linkedin_titles = prefs.linkedin_titles.slice(0, 6);
+        prefs.off_stack = prefs.off_stack.map((w) => (/^[a-z]+$/i.test(w) ? w.toLowerCase() + " " : w.toLowerCase()));
+        prefs.roles = prefs.roles.map((x) => x.toLowerCase());
+        const profile = draft.profile;
+        for (const k of ["full_name", "email", "phone", "city"]) profile.personal[k] = $(k).value.trim();
+        const parts = profile.personal.full_name.split(/\s+/);
+        profile.personal.first_name = profile.personal.first_name || parts[0] || "";
+        profile.personal.last_name = profile.personal.last_name || parts.slice(1).join(" ");
+        msg("finishMsg", "Saving…");
+        const res = await fetch("/api/onboarding/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile, prefs }) });
+        if (!res.ok) return msg("finishMsg", "Couldn't save", true);
+        location.href = "/#jobs";
+      };
+      loadKeys();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FresherPilot · Profile</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <style>
+      .page { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
+      .page h1 { margin: 0 0 4px; font-size: 1.3rem; }
+      .section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; margin-top: 14px; }
+      .section h2 { margin: 0 0 12px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }
+      .grid label, .stack label { display: grid; gap: 4px; font-size: 0.82rem; color: var(--muted); }
+      .grid input, .stack input, .stack textarea, .grid select {
+        font: inherit; font-size: 0.92rem; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+        background: var(--bg); color: var(--text); width: 100%; box-sizing: border-box;
+      }
+      .missing input { border-color: var(--warn); background: var(--warn-soft); }
+      .rows { display: grid; gap: 10px; }
+      .row-card { border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 8px; }
+      .row-card .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .stack { display: grid; gap: 8px; }
+      .stack textarea { min-height: 60px; resize: vertical; }
+      .bar { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; display: flex; gap: 12px; align-items: center; border-top: 1px solid var(--line); margin-top: 16px; }
+      .remove { justify-self: start; }
+      @media (max-width: 640px) { .grid, .row-card .grid { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <p><a href="/">← FresherPilot</a></p>
+      <h1>Applicant profile</h1>
+      <p class="muted">Used to fill application forms (browser extension) and to write cover letters and answers.
+        Highlighted fields are empty: forms asking for them will be left for you to fill.</p>
+      <form id="form"></form>
+      <div class="bar">
+        <button type="button" id="save" class="btn primary">Save profile</button>
+        <span id="msg" class="muted"></span>
+      </div>
+    </div>
+    <script>
+      const LABELS = {
+        first_name: "First name", middle_name: "Middle name", last_name: "Last name", full_name: "Full name", email: "Email",
+        phone: "Phone (10 digits)", phone_country_code: "Country code", city: "City", state: "State", country: "Country",
+        pincode: "Pincode", address: "Address", date_of_birth: "Date of birth (YYYY-MM-DD)", gender: "Gender", nationality: "Nationality",
+        linkedin: "LinkedIn URL", github: "GitHub URL", portfolio: "Portfolio / website", leetcode: "LeetCode URL",
+        total_experience_years: "Total experience (years)", relevant_experience: "Relevant experience (one line)",
+        current_company: "Current company", current_ctc_lpa: "Current CTC (LPA)", expected_ctc_lpa: "Expected CTC (LPA)",
+        notice_period: "Notice period", willing_to_relocate: "Willing to relocate", preferred_locations: "Preferred locations",
+        work_mode: "Work mode", authorized_to_work_in_india: "Authorized to work in India", requires_visa_sponsorship: "Needs visa sponsorship",
+        graduation_year: "Graduation year", available_from: "Available from", disability: "Disability", veteran: "Veteran",
+        caste_category: "Category (optional)", hispanic_latino: "Hispanic / Latino (US forms)", race_ethnicity: "Race / ethnicity (US forms)",
+      };
+      const SECTIONS = [["personal", "Personal details"], ["links", "Links"], ["job_preferences", "Job preferences"], ["diversity", "Diversity questions (optional; blank = 'prefer not to say')"]];
+      let profile = null, missing = [];
+      const esc = (v) => String(v ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+
+      function render() {
+        const f = document.getElementById("form");
+        let html = "";
+        for (const [key, title] of SECTIONS) {
+          html += `<section class="section"><h2>${title}</h2><div class="grid">`;
+          for (const [k, v] of Object.entries(profile[key] || {})) {
+            const miss = missing.includes(`${key}.${k}`) ? "missing" : "";
+            html += `<label class="${miss}">${LABELS[k] || k}<input data-sec="${key}" data-key="${k}" value="${esc(v)}" /></label>`;
+          }
+          html += `</div></section>`;
+        }
+        html += `<section class="section"><h2>Education</h2><div class="rows" id="edu">`;
+        (profile.education || []).forEach((e, i) => {
+          html += `<div class="row-card"><div class="grid">
+            ${["degree", "field", "institution", "end_year", "cgpa", "percentage"].map((k) =>
+              `<label>${{ end_year: "Year", cgpa: "CGPA", percentage: "Percentage" }[k] || k[0].toUpperCase() + k.slice(1)}<input data-edu="${i}" data-key="${k}" value="${esc(e[k])}" /></label>`).join("")}
+          </div></div>`;
+        });
+        html += `</div></section>`;
+        html += `<section class="section"><h2>Saved answers</h2>
+          <p class="muted" style="margin:0 0 10px">Exact answers for questions you get often (matched by question text). Everything else is answered by AI from your resume.</p>
+          <div class="rows" id="answers">`;
+        Object.entries(profile.custom_answers || {}).forEach(([q, a], i) => {
+          html += `<div class="row-card stack"><label>Question<input data-q="${i}" value="${esc(q)}" /></label>
+            <label>Answer<textarea data-a="${i}">${esc(a)}</textarea></label>
+            <button type="button" class="link-btn remove" data-remove="${i}">Remove</button></div>`;
+        });
+        html += `</div><p style="margin:10px 0 0"><button type="button" class="link-btn" id="addAnswer">+ Add a saved answer</button></p></section>`;
+        f.innerHTML = html;
+      }
+
+      function readForm() {
+        const out = JSON.parse(JSON.stringify(profile));
+        document.querySelectorAll("[data-sec]").forEach((el) => (out[el.dataset.sec][el.dataset.key] = el.value.trim()));
+        document.querySelectorAll("[data-edu]").forEach((el) => (out.education[+el.dataset.edu][el.dataset.key] = el.value.trim()));
+        const qs = [...document.querySelectorAll("[data-q]")];
+        out.custom_answers = {};
+        qs.forEach((q) => {
+          const a = document.querySelector(`[data-a="${q.dataset.q}"]`);
+          if (q.value.trim()) out.custom_answers[q.value.trim()] = a.value.trim();
+        });
+        return out;
+      }
+
+      document.addEventListener("click", (e) => {
+        if (e.target.id === "addAnswer") {
+          profile = readForm();
+          profile.custom_answers["New question"] = "";
+          render();
+        }
+        if (e.target.dataset.remove !== undefined) {
+          profile = readForm();
+          const key = Object.keys(profile.custom_answers)[+e.target.dataset.remove];
+          delete profile.custom_answers[key];
+          render();
+        }
+      });
+
+      document.getElementById("save").addEventListener("click", async () => {
+        const msg = document.getElementById("msg");
+        try {
+          const res = await fetch("/api/profile", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile: readForm() }) });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Save failed");
+          profile = data.profile; missing = data.missing; render();
+          msg.textContent = "Saved.";
+        } catch (err) { msg.textContent = err.message; }
+      });
+
+      fetch("/api/profile").then((r) => r.json()).then((d) => { profile = d.profile; missing = d.missing; render(); });
+    </script>
+  </body>
+</html>

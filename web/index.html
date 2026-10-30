@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FresherPilot</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">JF</span>
+        <div>
+          <h1>FresherPilot</h1>
+          <p class="tagline">Fresher AI / ML / Python roles matched to your resume</p>
+        </div>
+      </div>
+      <nav class="tabs" aria-label="Views">
+        <button type="button" class="tab" data-view="dashboard">Dashboard</button>
+        <button type="button" class="tab" data-view="jobs">Jobs <span id="tabNew" class="tab-badge" hidden></span></button>
+      </nav>
+      <div class="fetch">
+        <a class="btn ghost" href="/static/profile.html">Profile</a>
+        <a class="btn ghost" href="/account" id="userBtn" title="Settings: keys, search, password">Settings</a>
+        <button id="autoBtn" type="button" class="btn">Auto-apply all</button>
+        <button id="fetchBtn" type="button" class="btn primary">Fetch new jobs</button>
+      </div>
+    </header>
+
+    <div class="statusbar">
+      <p id="status" class="status">Loading…</p>
+      <p id="usage" class="status small" title="Groq's free tier allows 200,000 tokens per model per day"></p>
+      <div id="progress" class="progress" hidden><div id="progressFill"></div></div>
+    </div>
+    <p id="errors" class="errors" hidden></p>
+    <section id="autoPanel" class="auto-panel" hidden>
+      <div class="auto-head">
+        <strong id="autoTitle">Auto-apply</strong>
+        <button type="button" id="autoStop" class="link-btn">Stop</button>
+        <button type="button" id="autoClose" class="link-btn">Hide</button>
+      </div>
+      <p id="autoNow" class="muted small"></p>
+      <div id="autoWaiting" class="howto-banner" hidden>
+        <strong id="autoWaitingText"></strong>
+        <div class="row">
+          <button type="button" id="autoContinue" class="btn primary small">Continue</button>
+          <button type="button" id="autoSkip" class="btn small">Skip this job</button>
+        </div>
+      </div>
+      <ul id="autoLog" class="auto-log"></ul>
+    </section>
+
+    <!-- ============================================================ dashboard -->
+    <section id="dashboardView" class="view" hidden>
+      <div id="dash" class="dash"><p class="muted loading">Loading your dashboard…</p></div>
+    </section>
+
+    <!-- ============================================================ jobs -->
+    <section id="jobsView" class="view" hidden>
+      <dl class="stats" id="stats">
+        <div><dt>Relevant</dt><dd id="statKept">–</dd></div>
+        <div class="stat-new"><dt>New for you</dt><dd id="statNew">–</dd></div>
+        <div><dt>Filtered out</dt><dd id="statRejected">–</dd></div>
+        <div><dt>Last fetch</dt><dd id="statWhen">–</dd></div>
+        <p id="fetchReport" class="status small fetch-report"></p>
+      </dl>
+
+      <section class="toolbar" id="toolbar" hidden>
+        <input id="search" type="search" placeholder="Search title, company, skill…" aria-label="Search jobs" />
+        <div class="seg" role="group" aria-label="Sort">
+          <button type="button" class="seg-btn" data-sort="match">Best match</button>
+          <button type="button" class="seg-btn" data-sort="fresh">Newest</button>
+        </div>
+        <select id="days" aria-label="Posted within">
+          <option value="">Any time</option>
+          <option value="1">Last 24h</option>
+          <option value="3">Last 3 days</option>
+          <option value="7">Last 7 days</option>
+        </select>
+        <div id="sources" class="chips" aria-label="Sources"></div>
+        <div class="toggles">
+          <label><input type="checkbox" id="hideVisited" /> Hide visited</label>
+          <label><input type="checkbox" id="hideApplied" /> Hide applied</label>
+          <label><input type="checkbox" id="showUnchecked" /> Pending AI check</label>
+          <label><input type="checkbox" id="showRejected" /> Filtered-out <span id="rejectedCount" class="muted"></span></label>
+          <button type="button" id="markAllBtn" class="link-btn">Mark all shown as visited</button>
+        </div>
+      </section>
+
+      <main class="split" id="split">
+        <aside class="list-pane">
+          <p id="resultCount" class="muted count"></p>
+          <ul id="list" class="job-list"></ul>
+        </aside>
+        <section class="detail-pane" id="detail" aria-live="polite">
+          <div class="placeholder">
+            <p>Select a job to see details and people to reach out to.</p>
+          </div>
+        </section>
+      </main>
+    </section>
+
+    <!-- ============================================================ outreach draft -->
+    <dialog id="outreachDialog" class="modal" aria-labelledby="orTitle">
+      <form method="dialog" id="orForm" class="modal-body"></form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+
+    <script src="/static/app.js"></script>
+    <script src="/static/dashboard.js"></script>
+    <script src="/static/outreach.js"></script>
+  </body>
+</html>

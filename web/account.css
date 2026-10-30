@@ -1,0 +1,15 @@
+.setup { max-width: 760px; margin: 0 auto; padding: 28px 16px 48px; display: grid; gap: 16px; }
+.setup h1 { margin: 0; font-size: 1.3rem; }
+.step h2, .setup .panel h2 { margin: 0 0 6px; font-size: 1.05rem; display: flex; align-items: center; gap: 10px; }
+.num { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--accent);
+  color: var(--accent-ink); font-size: 0.85rem; }
+.setup .field { display: grid; gap: 5px; font-size: 0.85rem; color: var(--muted); font-weight: 600; margin-top: 12px; }
+.setup .field a { font-weight: 500; }
+.setup input:not([type=checkbox]):not([type=file]), .setup textarea {
+  font: inherit; font-size: 0.92rem; padding: 9px 11px; border-radius: 10px; border: 1px solid var(--line-strong);
+  background: var(--sunken); color: var(--text); width: 100%; }
+.setup textarea { resize: vertical; line-height: 1.45; }
+.setup .row { margin-top: 14px; align-items: center; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.setup details { margin-top: 10px; }
+@media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }

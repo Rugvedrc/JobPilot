@@ -1,0 +1,43 @@
+# Secrets
+.env
+*.key
+keys.enc
+
+# Per-user data (accounts, resumes, jobs, applications, logs) — never commit
+users/
+
+# Shared / legacy data and caches
+contacts_cache.json
+jobs_cache.json
+llm_verdicts.json
+embeddings_cache.npz
+visited.json
+applykit_cache.json
+applications.json
+applicant_profile.json
+autoapply_log.jsonl
+ai_usage.jsonl
+outreach_log.json
+outreach_settings.json
+*.moved-to-account
+crash.log
+*.log
+
+# Resumes and other personal documents
+*.pdf
+*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.autoapply-browser/
+.claude/
