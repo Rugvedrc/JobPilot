@@ -11,11 +11,17 @@
         padding: 28px; box-shadow: var(--shadow-lg); display: grid; gap: 16px; }
       .auth-card h1 { margin: 0; font-size: 1.3rem; }
       .auth-card label { display: grid; gap: 5px; font-size: 0.85rem; color: var(--muted); font-weight: 600; }
-      .auth-card input { font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line-strong);
+      .auth-card input:not([type="checkbox"]) { font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line-strong);
         background: var(--sunken); color: var(--text); }
       .auth-card .btn { justify-content: center; }
       .auth-msg { margin: 0; color: var(--bad); font-size: 0.88rem; min-height: 1.2em; }
       .switch { text-align: center; font-size: 0.88rem; color: var(--muted); }
+      .consent { display: flex !important; gap: 8px; align-items: flex-start; font-weight: 400 !important; line-height: 1.4; }
+      .consent input { margin-top: 3px; }
+      .divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.8rem; }
+      .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+      #google { display: flex; justify-content: center; min-height: 44px; }
+      .legal { text-align: center; font-size: 0.78rem; color: var(--muted); margin: 0; }
     </style>
   </head>
   <body>
@@ -23,17 +29,29 @@
       <form class="auth-card" id="form">
         <div class="brand"><span class="logo" aria-hidden="true">JF</span>
           <div><h1 id="heading">Sign in</h1><p class="tagline" id="sub">Your jobs, matched to your resume</p></div></div>
+
+        <div id="googleBox" hidden>
+          <div id="google"></div>
+          <p class="muted small" style="text-align:center;margin:6px 0 0">Invite-only: use the email the owner invited.</p>
+        </div>
+        <div class="divider" id="divider" hidden>or</div>
+
         <label>Username<input id="username" autocomplete="username" required minlength="3" /></label>
         <label>Password<input id="password" type="password" autocomplete="current-password" required minlength="8" /></label>
+        <label class="consent" id="consentRow" hidden><input type="checkbox" id="consent" />
+          <span>I agree to the <a href="/terms" target="_blank">Terms</a> and the <a href="/privacy" target="_blank">Privacy Policy</a>, and I'm 18 or older.</span></label>
         <p class="auth-msg" id="msg" role="alert"></p>
         <button class="btn primary" type="submit" id="submit">Sign in</button>
-        <p class="switch"><span id="switchText">New here?</span> <button type="button" class="link-btn" id="switchBtn">Create an account</button></p>
+        <p class="switch" id="switchRow" hidden><span id="switchText">New here?</span> <button type="button" class="link-btn" id="switchBtn">Create an account</button></p>
         <p class="muted small" id="note" hidden>The first account on this computer becomes the owner and keeps the existing jobs, profile and keys.</p>
+        <p class="legal"><a href="/terms">Terms</a> · <a href="/privacy">Privacy</a></p>
       </form>
     </main>
     <script>
       const $ = (id) => document.getElementById(id);
       let mode = "login";
+      let pendingCredential = null; // a Google sign-in waiting for the user to accept the terms
+
       function setMode(m) {
         mode = m;
         const reg = m === "register";
@@ -42,20 +60,67 @@
         $("switchText").textContent = reg ? "Already have an account?" : "New here?";
         $("switchBtn").textContent = reg ? "Sign in" : "Create an account";
         $("password").autocomplete = reg ? "new-password" : "current-password";
+        $("consentRow").hidden = !reg;
         $("msg").textContent = "";
       }
+
+      async function post(url, body) {
+        const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        return { res, data: await res.json().catch(() => ({})) };
+      }
+
+      async function googleSignIn(credential) {
+        $("msg").textContent = "";
+        const { res, data } = await post("/api/auth/google", { credential, consent: $("consent").checked });
+        if (res.status === 428) {
+          // New account: ask for consent, then continue with the same Google sign-in.
+          pendingCredential = credential;
+          setMode("google-consent");
+          $("heading").textContent = "Create your account";
+          $("consentRow").hidden = false;
+          for (const id of ["username", "password"]) { $(id).required = false; $(id).closest("label").hidden = true; }
+          $("switchRow").hidden = true;
+          $("submit").textContent = "Continue with Google";
+          $("msg").textContent = data.detail;
+          return;
+        }
+        if (!res.ok) return ($("msg").textContent = data.detail || "Google sign-in failed");
+        location.href = data.next || "/";
+      }
+
       fetch("/api/auth/state").then((r) => r.json()).then((s) => {
         if (!s.has_accounts) { setMode("register"); $("note").hidden = false; }
+        else if (s.local_mode) {
+          $("sub").textContent = "Sign in once on this computer; after that the app opens without asking.";
+        }
+        $("switchRow").hidden = !s.password_signup;
+        if (s.google_client_id) {
+          const script = document.createElement("script");
+          script.src = "https://accounts.google.com/gsi/client";
+          script.async = true;
+          script.onload = () => {
+            google.accounts.id.initialize({ client_id: s.google_client_id, callback: (r) => googleSignIn(r.credential) });
+            google.accounts.id.renderButton($("google"), { theme: "outline", size: "large", width: 300, text: "continue_with" });
+          };
+          document.head.appendChild(script);
+          $("googleBox").hidden = false;
+          $("divider").hidden = false;
+        }
       });
+
       $("switchBtn").onclick = () => setMode(mode === "login" ? "register" : "login");
       $("form").onsubmit = async (e) => {
         e.preventDefault();
+        if (mode === "google-consent") {
+          if (!$("consent").checked) return ($("msg").textContent = "Please tick the box to accept the Terms and Privacy Policy.");
+          return googleSignIn(pendingCredential);
+        }
+        if (mode === "register" && !$("consent").checked) return ($("msg").textContent = "Please accept the Terms and Privacy Policy.");
         $("submit").disabled = true;
         $("msg").textContent = "";
         try {
-          const res = await fetch(`/api/auth/${mode}`, { method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username: $("username").value, password: $("password").value }) });
-          const data = await res.json();
+          const { res, data } = await post(`/api/auth/${mode}`,
+            { username: $("username").value, password: $("password").value, consent: $("consent").checked });
           if (!res.ok) throw new Error(data.detail || "Something went wrong");
           location.href = data.next || "/";
         } catch (err) {

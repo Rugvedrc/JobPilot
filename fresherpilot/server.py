@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fresherpilot.apply import applicant
 from fresherpilot.outreach import contacts
 from fresherpilot.jobs import dashboard
-from fresherpilot.jobs import llm_filter
+from fresherpilot.jobs import live_poller, llm_filter
 from fresherpilot.outreach import messages as outreach
 from fresherpilot.core import users
 from fresherpilot.jobs import visited
@@ -56,7 +56,9 @@ def _T() -> dict[str, dict[str, Any]]:
 
 
 def _status() -> dict[str, Any]:
-    return {"fetch": dict(_T()["fetch"]), "check": dict(_T()["check"]), "running": _T()["fetch"]["running"] or _T()["check"]["running"]}
+    live = live_poller.status()
+    return {"fetch": dict(_T()["fetch"]), "check": dict(_T()["check"]), "live": live,
+            "running": _T()["fetch"]["running"] or _T()["check"]["running"] or bool(live.get("busy"))}
 
 
 def _normalized_jobs(payload: dict | None) -> list[dict[str, Any]]:
@@ -66,7 +68,10 @@ def _normalized_jobs(payload: dict | None) -> list[dict[str, Any]]:
     ]
 
 
-AI_BATCH = 10  # jobs per AI step; results appear in the list after each step (~1 minute)
+# Jobs per AI step; results appear in the list after each step. 30, not 10: the free title rules drop
+# about half, and with only 10 the facts calls held 3-5 jobs each, so the ~900-token instructions were
+# re-sent for every few jobs (and the 60-title screen got 10). Fuller calls = fewer tokens per job.
+AI_BATCH = 30
 _contacts_thread: threading.Thread | None = None
 
 
@@ -148,7 +153,26 @@ def _start_fetch() -> bool:
     return True
 
 
+def _setup_missing() -> str | None:
+    """Why the AI check can't run yet for this user (no AI key / no resume), or None."""
+    from fresherpilot.jobs import candidate
+
+    if not (users.key("GROQ_API_KEY") or users.key("NVIDIA_API_KEY")):
+        return "Add your free Groq API key in Settings so the AI can check which jobs fit you."
+    try:
+        has_resume = candidate._resume_path().exists()
+    except Exception:  # noqa: BLE001
+        has_resume = False
+    if not has_resume and not users.prefs().get("skills"):
+        return "Add your resume (Settings → Upload a new resume) so jobs can be matched to you."
+    return None
+
+
 def _start_checker() -> bool:
+    missing = _setup_missing()
+    if missing:
+        _T()["check"].update(error=missing)
+        return False
     with _task_lock:
         if _T()["check"]["running"] or time.time() < _T()["check"].get("paused_until", 0):
             return False
@@ -205,6 +229,8 @@ def _pack(payload: dict | None) -> dict[str, Any]:
         "rejected_by_category": dict(Counter(j["ai_category"] for j in jobs if j["status"] == "reject")),
         "fetch_report": (payload or {}).get("fetch_report") or {},
         "skipped_sources": (payload or {}).get("skipped_sources") or [],
+        "no_apify_credit": (payload or {}).get("no_apify_credit") or [],
+        "extension_sweeps": (payload or {}).get("extension_sweeps") or {},
         "task": _status(),
         "jobs": jobs,
     }
@@ -215,7 +241,7 @@ def _pack(payload: dict | None) -> dict[str, Any]:
 # Every /api call runs for the logged-in user: the session cookie (the app) or the X-JF-Token header
 # (the browser extension). Pages redirect to /login when nobody is logged in.
 
-PUBLIC = ("/api/auth/", "/static/", "/login", "/favicon")
+PUBLIC = ("/api/auth/", "/api/health", "/static/", "/login", "/favicon", "/privacy", "/terms")
 COOKIE = "jf_session"
 
 
@@ -233,6 +259,16 @@ class UserContext:
         token = headers.get("x-jf-token") or cookies.get(COOKIE)
         uid = users.session_user(token)
         path = scope.get("path", "")
+        if users.local_mode() and _from_this_computer(scope, headers):
+            if uid and uid == users.owner_id():
+                users.remember_local(token)  # next time: no sign-in needed
+            elif not uid and not path.startswith("/api/auth/"):
+                local = users.local_token()  # local mode: the owner, without a sign-in page
+                if local:
+                    uid, token = users.session_user(local), local
+                    scope = {**scope, "headers": [h for h in scope.get("headers") or [] if h[0].lower() != b"cookie"]
+                             + [(b"cookie", f"{COOKIE}={local}".encode())]}
+                    send = _add_cookie(send, local)
         if not uid and not path.startswith(PUBLIC):
             if path.startswith("/api/"):
                 return await JSONResponse({"detail": "Please log in"}, status_code=401)(scope, receive, send)
@@ -245,7 +281,64 @@ class UserContext:
             users._current.reset(reset)
 
 
+def _from_this_computer(scope, headers: dict[str, str]) -> bool:
+    """A request from this PC itself, not one that came in through Cloudflare / a proxy."""
+    client = (scope.get("client") or ("", 0))[0]
+    proxied = any(h in headers for h in ("cf-connecting-ip", "x-forwarded-for", "cf-ray"))
+    return client in ("127.0.0.1", "::1", "localhost") and not proxied
+
+
+def _add_cookie(send, token: str):
+    """Give the browser the automatic local session (so the extension can pick it up too)."""
+    async def wrapped(message):
+        if message["type"] == "http.response.start":
+            headers = list(message.get("headers") or [])
+            headers.append((b"set-cookie", f"{COOKIE}={token}; HttpOnly; Path=/; SameSite=lax; "
+                                           f"Max-Age={users.SESSION_DAYS * 86400}".encode()))
+            message = {**message, "headers": headers}
+        await send(message)
+    return wrapped
+
+
 app.add_middleware(UserContext)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if _https(request):
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
+
+
+def _https(request: Request) -> bool:
+    """Behind Cloudflare the app sees http from cloudflared; the browser's scheme is in the headers."""
+    return (request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+            or "https" in request.headers.get("cf-visitor", ""))
+
+
+def _client_ip(request: Request) -> str:
+    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
+
+
+_failures: dict[str, list[float]] = {}
+
+
+def _rate_limit(request: Request) -> None:
+    """At most 10 failed sign-ins per IP in 15 minutes."""
+    ip = _client_ip(request)
+    recent = [t for t in _failures.get(ip, []) if time.time() - t < 900]
+    _failures[ip] = recent
+    if len(recent) >= 10:
+        raise HTTPException(status_code=429, detail="Too many attempts. Try again in 15 minutes.")
+
+
+def _failed(request: Request) -> None:
+    _failures.setdefault(_client_ip(request), []).append(time.time())
 
 
 def _token(request: Request) -> str | None:
@@ -260,7 +353,9 @@ def index():
 
 
 @app.get("/login")
-def login_page() -> FileResponse:
+def login_page():
+    if users.current() and users.local_mode():  # already signed in automatically (local mode)
+        return RedirectResponse("/")
     return FileResponse(STATIC / "login.html")
 
 
@@ -274,51 +369,140 @@ def account_page() -> FileResponse:
     return FileResponse(STATIC / "account.html")
 
 
+@app.get("/api/health")
+def health() -> dict:
+    """For uptime checks (public, no data)."""
+    return {"ok": True}
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" '
+           'fill="#0f7b5f"/><text x="16" y="21" font-size="13" font-family="Arial" font-weight="700" '
+           'fill="#fff" text-anchor="middle">JF</text></svg>')
+    return Response(svg, media_type="image/svg+xml", headers={"Cache-Control": "max-age=86400"})
+
+
+@app.get("/privacy")
+def privacy_page() -> FileResponse:
+    return FileResponse(STATIC / "privacy.html")
+
+
+@app.get("/terms")
+def terms_page() -> FileResponse:
+    return FileResponse(STATIC / "terms.html")
+
+
 class Credentials(BaseModel):
     username: str
     password: str
+    consent: bool = False
 
 
-def _with_cookie(token: str, body: dict) -> JSONResponse:
+class GoogleCredential(BaseModel):
+    credential: str
+    consent: bool = False
+
+
+def _with_cookie(token: str, body: dict, request: Request) -> JSONResponse:
     resp = JSONResponse(body)
-    resp.set_cookie(COOKIE, token, httponly=True, samesite="lax", max_age=users.SESSION_DAYS * 86400)
+    resp.set_cookie(COOKIE, token, httponly=True, samesite="lax", secure=_https(request),
+                    max_age=users.SESSION_DAYS * 86400)
     return resp
+
+
+def _password_signup() -> bool:
+    """Username/password sign-up: only for the very first account, unless FP_PASSWORD_SIGNUP=1.
+    Everyone else joins with Google, and only if the owner invited their email."""
+    return not users.list_usernames() or os.getenv("FP_PASSWORD_SIGNUP") == "1"
+
+
+def _legal() -> dict[str, str]:
+    return {"operator": os.getenv("FP_OPERATOR_NAME", "the owner of this FresherPilot instance"),
+            "contact": os.getenv("FP_CONTACT_EMAIL", ""), "terms_version": users.TERMS_VERSION}
 
 
 @app.get("/api/auth/state")
 def auth_state() -> dict:
-    return {"has_accounts": bool(users.list_usernames())}
+    return {"has_accounts": bool(users.list_usernames()), "local_mode": users.local_mode(),
+            "google_client_id": os.getenv("GOOGLE_CLIENT_ID", "") if not users.local_mode() else "",
+            "password_signup": _password_signup(), **_legal()}
+
+
+def _verify_google(credential: str) -> dict[str, Any]:
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Google sign-in isn't set up on this server (GOOGLE_CLIENT_ID).")
+    from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token
+
+    try:
+        return id_token.verify_oauth2_token(credential, google_requests.Request(), client_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Google sign-in failed. Please try again.") from exc
+
+
+@app.post("/api/auth/google")
+def google_login(body: GoogleCredential, request: Request) -> JSONResponse:
+    _rate_limit(request)
+    info = _verify_google(body.credential)
+    try:
+        token, created = users.google_login(info, body.consent)
+    except users.ConsentRequired as exc:
+        return JSONResponse({"detail": str(exc), "consent_required": True}, status_code=428)
+    except ValueError as exc:
+        _failed(request)
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    uid = users.session_user(token)
+    reset = users.set_current(uid)
+    try:
+        if created and not (users.get(uid)["owner"] and users.path("applicant_profile.json").exists()):
+            users.save_prefs({"onboarded": False})
+        nxt = "/" if users.prefs().get("onboarded", True) else "/onboarding"
+    finally:
+        users._current.reset(reset)
+    return _with_cookie(token, {"user": users.get(uid), "next": nxt}, request)
 
 
 @app.post("/api/auth/register")
-def register(body: Credentials) -> JSONResponse:
+def register(body: Credentials, request: Request) -> JSONResponse:
+    _rate_limit(request)
+    if not _password_signup():
+        raise HTTPException(status_code=403, detail="This app is invite-only: sign in with Google using your invited email.")
+    if not body.consent:
+        raise HTTPException(status_code=400, detail="Please accept the Terms and Privacy Policy.")
     try:
-        user = users.register(body.username, body.password)
+        user = users.register(body.username, body.password, consent=True)
         token = users.login(body.username, body.password)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not user["owner"]:
-        reset = users.set_current(user["id"])
-        try:
+    reset = users.set_current(user["id"])
+    try:
+        onboarded = user["owner"] and users.path("applicant_profile.json").exists()  # owner with old data
+        if not onboarded:
             users.save_prefs({"onboarded": False})
-        finally:
-            users._current.reset(reset)
-    return _with_cookie(token, {"user": user, "next": "/" if user["owner"] else "/onboarding"})
+    finally:
+        users._current.reset(reset)
+    return _with_cookie(token, {"user": user, "next": "/" if onboarded else "/onboarding"}, request)
 
 
 @app.post("/api/auth/login")
-def do_login(body: Credentials) -> JSONResponse:
+def do_login(body: Credentials, request: Request) -> JSONResponse:
+    _rate_limit(request)
     try:
         token = users.login(body.username, body.password)
     except ValueError as exc:
+        _failed(request)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     uid = users.session_user(token)
+    if users.local_mode():
+        users.remember_local(token)  # the owner won't be asked again on this computer
     reset = users.set_current(uid)
     try:
         nxt = "/" if users.prefs().get("onboarded", True) else "/onboarding"
     finally:
         users._current.reset(reset)
-    return _with_cookie(token, {"user": users.get(uid), "next": nxt})
+    return _with_cookie(token, {"user": users.get(uid), "next": nxt}, request)
 
 
 @app.post("/api/auth/logout")
@@ -330,10 +514,98 @@ def do_logout(request: Request) -> JSONResponse:
 
 
 @app.get("/api/me")
-def me(request: Request) -> dict:
+def me(request: Request, response: Response) -> dict:
     uid = users.current()
-    return {"user": users.get(uid), "keys": users.keys_status(), "prefs": users.prefs(),
-            "extension_token": users.extension_token(_token(request))}
+    live_poller.ensure_running(_start_checker, _start_fetch)  # free boards, read all the time
+    token = request.cookies.get(COOKIE)
+    if token and users.touch(token):  # keep the login alive while the app is used
+        response.set_cookie(COOKIE, token, httponly=True, samesite="lax", secure=_https(request),
+                            max_age=users.SESSION_DAYS * 86400)
+    user = users.get(uid) or {}
+    from fresherpilot.jobs import candidate
+
+    try:
+        has_resume = candidate._resume_path().exists()
+    except Exception:  # noqa: BLE001
+        has_resume = False
+    setup = {"ai_key": bool(users.key("GROQ_API_KEY") or users.key("NVIDIA_API_KEY")), "resume": has_resume}
+    return {"user": user, "keys": users.keys_status(), "prefs": users.prefs(), "setup": setup,
+            "extension_token": users.extension_token(_token(request)),
+            "google_client_id": os.getenv("GOOGLE_CLIENT_ID", ""), **_legal(),
+            "needs_consent": (user.get("consent") or {}).get("version") != users.TERMS_VERSION}
+
+
+# ---------------------------------------------------------------- account: Google link, consent, data rights
+
+@app.post("/api/account/google")
+def link_google(body: GoogleCredential, request: Request) -> dict:
+    try:
+        return {"user": users.link_google(_token(request), _verify_google(body.credential))}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/account/consent")
+def accept_terms() -> dict:
+    users.record_consent(users.current())
+    return {"user": users.get(users.current())}
+
+
+@app.get("/api/account/export")
+def export_data() -> Response:
+    """Everything stored for this account, as a zip (right to access your data)."""
+    uid = users.current()
+    return Response(users.export_zip(uid), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="fresherpilot-{uid}.zip"'})
+
+
+@app.post("/api/account/delete")
+def delete_my_account(body: dict, request: Request) -> JSONResponse:
+    """Delete this account and all its data (right to erasure). Needs {"confirm": "DELETE"}."""
+    if body.get("confirm") != "DELETE":
+        raise HTTPException(status_code=400, detail='Type DELETE to confirm.')
+    uid = users.current()
+    try:
+        live_poller.stop(uid)
+        users.delete_account(uid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE)
+    return resp
+
+
+# ---------------------------------------------------------------- owner: invites and accounts
+
+def _owner_only() -> None:
+    if not (users.get(users.current()) or {}).get("owner"):
+        raise HTTPException(status_code=403, detail="Only the owner can do this.")
+
+
+@app.get("/api/admin/invites")
+def get_invites() -> dict:
+    _owner_only()
+    return {"emails": users.allowed_emails(), "users": users.list_users()}
+
+
+@app.put("/api/admin/invites")
+def put_invites(body: dict) -> dict:
+    _owner_only()
+    emails = body.get("emails")
+    if not isinstance(emails, list):
+        raise HTTPException(status_code=400, detail="Expected {emails: [...]}")
+    return {"emails": users.save_allowlist(emails), "users": users.list_users()}
+
+
+@app.delete("/api/admin/users/{uid}")
+def remove_user(uid: str) -> dict:
+    _owner_only()
+    try:
+        live_poller.stop(uid)
+        users.delete_account(uid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"users": users.list_users()}
 
 
 @app.put("/api/account/keys")
@@ -388,6 +660,7 @@ def onboarding_save(body: dict) -> dict:
 
 @app.get("/api/jobs")
 def cached_jobs() -> dict:
+    live_poller.ensure_running(_start_checker, _start_fetch)
     payload = load_cache()
     # Unchecked jobs (new, or left over when Groq's daily limit ran out) start the checker; after a
     # quota error it waits 30 minutes before trying again.
@@ -410,9 +683,50 @@ def status() -> dict:
 
 @app.post("/api/fetch", status_code=202)
 def fetch_jobs() -> dict:
-    if not _start_fetch():
+    """Fetch everywhere now: the live boards (LinkedIn round, Indeed, Internshala, Wellfound) start at
+    once and save jobs as they find them; the regular fetch covers Naukri, career pages and Telegram."""
+    live_poller.ensure_running(_start_checker, _start_fetch)
+    live = live_poller.run_now()
+    started = _start_fetch()
+    if not started and not live:
         raise HTTPException(status_code=409, detail="A fetch is already running")
     return _status()
+
+
+@app.get("/api/naukri/sweep")
+def naukri_sweep_plan() -> dict:
+    """Naukri search pages for the extension to read in the user's browser (free Naukri coverage)."""
+    from fresherpilot.jobs import apify_jobs
+
+    return apify_jobs.naukri_sweep_plan()
+
+
+@app.post("/api/import_jobs")
+def import_jobs(body: dict) -> dict:
+    """Jobs the extension read from a job board page; merged like a fetch, then AI-checked."""
+    from fresherpilot.jobs import apify_jobs
+
+    kind, items = body.get("kind"), body.get("jobs")
+    if kind != "naukri" or not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="Expected {kind: 'naukri', jobs: [...]}")
+    result = apify_jobs.merge_external([j for j in items[:500] if isinstance(j, dict)], kind)
+    if result["added"]:
+        _start_checker()
+    return result
+
+
+@app.post("/api/missed")
+def report_missed(body: dict) -> dict:
+    """A job the user saw somewhere: did we have it? If not, import it and log the miss."""
+    from fresherpilot.jobs import missed
+
+    try:
+        result = missed.report(str(body.get("url") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result.get("imported"):
+        _start_checker()
+    return {**result, "by_source": missed.summary()}
 
 
 @app.get("/api/contacts")
@@ -687,8 +1001,10 @@ def outreach_job(uid: str) -> dict:
 def run() -> None:
     import uvicorn
 
-    print("FresherPilot running at http://localhost:8000  (Ctrl+C to stop)")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # 127.0.0.1 only: the internet reaches the app through Cloudflare Tunnel, never directly.
+    host, port = os.getenv("FP_HOST", "127.0.0.1"), int(os.getenv("FP_PORT", "8000"))
+    print(f"FresherPilot running at http://localhost:{port}  (Ctrl+C to stop)")
+    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="127.0.0.1")
 
 
 if __name__ == "__main__":

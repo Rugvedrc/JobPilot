@@ -16,7 +16,7 @@ CASES = [
     # Internship experience asked for != internship role
     ("keep", "Python Developer", "0-1 years", "Full-time role. Candidates with 6 months of internship experience preferred. Build Django APIs."),
     ("keep", "Software Engineer", "", "Requirements: 1 year of experience (internships count). Write backend services in Go or Python."),
-    ("reject", "Software Engineer", "", "Requirements: 1 year of professional full-time experience. Write backend services in Python."),
+    ("stretch", "Software Engineer", "", "Requirements: 1 year of professional full-time experience. Write backend services in Python."),
     # Role itself is an internship, even though the title doesn't say so
     ("reject", "Python Developer", "", "This is a 6-month internship with a stipend of 15k. Work on Flask APIs."),
     ("reject", "Artificial Intelligence Engineer", "0-1 years", "Internship Duration: 6 Months. Full-Time CTC After Internship: 3-4 LPA. Build ML models."),
@@ -35,7 +35,7 @@ CASES = [
     ("reject", "AI Engineer", "0-5 years", "Requirements: minimum 3 years of hands-on experience deploying ML models in production."),
     ("reject", "Senior Python Developer", "", "Build APIs."),
     ("reject", "Software Engineer II", "", "Own services end to end."),
-    ("reject", "Generative AI Engineer", "Associate", "We're Hiring | GenAI Agentic Developer | 1–4 Years. Build RAG and agent apps."),
+    ("stretch", "Generative AI Engineer", "Associate", "We're Hiring | GenAI Agentic Developer | 1–4 Years. Build RAG and agent apps."),
     ("reject", "Associate Software Engineer Dotnet Developer", "0-2 years", "0-2 years experience in software development. 1+ years minimum experience with C# preferred."),  # off-stack
     ("reject", "Data Engineer", "", "2-5 years of experience with Spark and Airflow required."),
     # Trainee is full-time unless it says otherwise
@@ -45,8 +45,8 @@ CASES = [
     ("reject", "AI Engineer - AI & Automation", "Not specified",
      "At eBay, we're more than a global ecommerce leader. " + "Our culture values curiosity, inclusion and impact across teams worldwide. " * 60
      + "\nWhat you bring:\n- 4+ years of experience building ML systems in production\n- Python, PyTorch"),
-    ("reject", "LLM Ops Engineer", "Associate", "Experience: 1–2 years. Deploy and monitor LLM services with Python and Kubernetes."),
-    ("reject", "AI/ML Engineer", "Not specified", "Requirements: 1+ years of experience with Python and ML libraries."),
+    ("stretch", "LLM Ops Engineer", "Associate", "Experience: 1–2 years. Deploy and monitor LLM services with Python and Kubernetes."),
+    ("stretch", "AI/ML Engineer", "Not specified", "Requirements: 1+ years of experience with Python and ML libraries."),
     ("reject", "Voice AI Engineer — End-to-End Implementation", "3-5 years", "Build voice agents with Python and Twilio."),
     ("reject", "Solutions Engineer - Commercial Accounts", "Not specified", "Partner with account executives to win deals, run product demos, 5+ years pre-sales."),
     ("reject", "Applied AI Engineer", "Not Applicable", "Qualifications: BS and 5-8 years of experience / MS and 3-6 years / PhD and 0-3 years. Build LLM apps."),
@@ -82,7 +82,7 @@ def main() -> int:
     failed = 0
     for (expected, title, _, desc), job in zip(CASES, jobs):
         verdict = llm_filter.cached_verdict(job)
-        got = verdict["decision"] if verdict else "ERROR"
+        got = ("stretch" if verdict.get("category") == "stretch" else verdict["decision"]) if verdict else "ERROR"
         ok = got == expected
         failed += not ok
         print(f"{'PASS' if ok else 'FAIL'}  want={expected:6} got={got:6} {title[:38]:38} | {(verdict or {}).get('fit_reason') or (verdict or {}).get('reason', errors.get(llm_filter.job_key(job), ''))[:90]}")

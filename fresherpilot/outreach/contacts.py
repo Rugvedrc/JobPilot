@@ -152,27 +152,10 @@ def _jd_phrase(description: str) -> str:
 
 
 def _ask_llm(prompt: str) -> dict[str, Any]:
-    """Small JSON question to Groq, using whichever model still has daily quota."""
+    """Small JSON question to the AI, using whichever key / model still has daily quota."""
     from fresherpilot.jobs import llm_filter
-    from groq import RateLimitError
 
-    client = llm_filter._client()
-    for model in reversed(llm_filter.MODELS):  # smallest model first: this task is easy
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-            "max_completion_tokens": 1500,
-        }
-        if model.startswith("openai/gpt-oss"):
-            kwargs["reasoning_effort"] = "low"
-        try:
-            content = client.chat.completions.create(**kwargs).choices[0].message.content or "{}"
-            return json.loads(content)
-        except (RateLimitError, json.JSONDecodeError):
-            continue
-    return {}
+    return llm_filter.ask_json(prompt)
 
 
 def identify_employer(job: dict[str, Any], refresh: bool = False) -> dict[str, Any]:

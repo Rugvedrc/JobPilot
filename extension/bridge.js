@@ -1,4 +1,4 @@
-// Runs on the FresherPilot app page (localhost). Lets the app start auto-apply in this browser.
+// Runs on the FresherPilot app page (localhost, or the address set in the popup). Lets the app start auto-apply in this browser.
 document.documentElement.dataset.jobfinderExtension = chrome.runtime.getManifest().version;
 
 function toBackground(message, reply) {

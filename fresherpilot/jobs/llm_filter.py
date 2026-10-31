@@ -29,6 +29,9 @@ load_dotenv(ROOT / ".env")
 
 # Tried in order; when one hits its daily token limit the next is used.
 MODELS = [m.strip() for m in os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b").split(",") if m.strip()]
+# NVIDIA (build.nvidia.com, OpenAI-compatible): the last fallback, after every Groq key is used up.
+NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+NVIDIA_MODELS = [m.strip() for m in os.getenv("NVIDIA_MODELS", "openai/gpt-oss-20b,deepseek-ai/deepseek-v4.1-flash,nvidia/nemotron-3-super-120b-a12b").split(",") if m.strip()]
 PROMPT_VERSION = os.getenv("JF_PROMPT_VERSION") or "v7-facts"  # bump when the meaning of the prompt changes (env override = tests)
 BATCH_SIZE = 10  # jobs per AI call: the instructions are shared by all of them
 JD_CHARS = 2800
@@ -240,6 +243,8 @@ def cached_verdict(job: dict[str, Any]) -> dict[str, Any] | None:
     facts = cache.get(job_key(job))
     if not facts:
         return None
+    if facts.get("prescreen") == "board" and not _board_reject(job):
+        return None  # rejected under an older board rule: check it again
     decision, category, credit = _decision(job, facts, cache)
     if credit == "pending":
         return None  # a 1-year job whose post mentions internships: internship-credit check pending
@@ -310,22 +315,60 @@ class DailyLimitReached(RuntimeError):
 _exhausted: dict[str, float] = {}  # "<user>:<model>" -> time its daily limit was hit (each user has own key)
 
 
-def _quota_key(model: str) -> str:
+def _quota_key(model: str, label: str = "groq1") -> str:
     from fresherpilot.core import users
 
-    return f"{users.current()}:{model}"
+    return f"{users.current()}:{label}:{model}"
 _EXHAUSTED_FOR = 30 * 60  # try an exhausted model again after 30 minutes
 
 
-def _client():
+class _Pool:
+    """Every AI key of the user, in the order they're tried: Groq key 1, 2, ... then NVIDIA.
+    entries = [(label, provider, client, models)]."""
+
+    def __init__(self, entries: list[tuple[str, str, Any, list[str]]]):
+        self.entries = entries
+
+
+def _split_keys(value: str) -> list[str]:
+    return [k.strip().strip('"').strip("'") for k in re.split(r"[,;\s]+", value or "") if k.strip().strip('"').strip("'")]
+
+
+def _client() -> _Pool:
     from groq import Groq
 
     from fresherpilot.core import users
 
-    key = users.key("GROQ_API_KEY").strip('"').strip("'")
-    if not key:
-        raise RuntimeError("No Groq API key: add yours in Settings (free at console.groq.com/keys).")
-    return Groq(api_key=key, max_retries=2, timeout=120)
+    entries: list[tuple[str, str, Any, list[str]]] = []
+    for i, key in enumerate(dict.fromkeys(_split_keys(users.key("GROQ_API_KEY"))), 1):
+        entries.append((f"groq{i}", "groq", Groq(api_key=key, max_retries=0, timeout=120), MODELS))
+    nvidia = _split_keys(users.key("NVIDIA_API_KEY"))
+    if nvidia:
+        from openai import OpenAI
+
+        for i, key in enumerate(dict.fromkeys(nvidia), 1):
+            entries.append((f"nvidia{i}", "nvidia", OpenAI(api_key=key, base_url=NVIDIA_BASE, max_retries=0, timeout=120),
+                            NVIDIA_MODELS))
+    if not entries:
+        raise RuntimeError("No AI key: add a Groq key in Settings (free at console.groq.com/keys).")
+    return _Pool(entries)
+
+
+def _status(exc: Exception) -> int:
+    return int(getattr(exc, "status_code", 0) or getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+
+
+def _json_text(content: str) -> str:
+    """Models without JSON mode sometimes wrap the answer in ```json fences or add a sentence."""
+    text = (content or "").strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if m:
+        text = m.group(1).strip()
+    if not text.startswith("{"):
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start:end + 1]
+    return text or "{}"
 
 
 def _wait_seconds(message: str) -> float:
@@ -339,14 +382,14 @@ def _usage_path() -> Path:
     return users.path("ai_usage.jsonl")
 
 
-def _log_usage(step: str, model: str, response: Any) -> None:
+def _log_usage(step: str, model: str, response: Any, key: str = "groq1") -> None:
     """One line per AI call: which step, which model, tokens in/out/reasoning."""
     try:
         u = response.usage
         details = getattr(u, "completion_tokens_details", None)
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "step": step, "model": model, "in": u.prompt_tokens,
                "out": u.completion_tokens, "reasoning": getattr(details, "reasoning_tokens", None) if details else None,
-               "total": u.total_tokens}
+               "total": u.total_tokens, "key": key}
         with _lock, _usage_path().open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:  # noqa: BLE001 — logging must never break a call
@@ -397,12 +440,31 @@ def _create(client, messages: list[dict[str, str]], schema: dict[str, Any] | Non
     """Call the first model that still has quota. Returns (content, model).
 
     models / effort override the default order and reasoning effort (e.g. small + low for easy tasks)."""
-    from groq import BadRequestError, RateLimitError
-
     schema = schema or SCHEMA
+    pool = client if isinstance(client, _Pool) else _Pool([("groq1", "groq", client, MODELS)])
+    for label, provider, api, default_models in pool.entries:
+        wanted = (models or default_models) if provider == "groq" else default_models
+        result = _create_one(api, provider, label, messages, schema, name, wanted, effort)
+        if result:
+            return result
+    raise DailyLimitReached(
+        "Daily AI limit reached on every key (Groq free tier: 200k tokens/day per model per key"
+        + (", NVIDIA included" if any(e[1] == "nvidia" for e in pool.entries) else "")
+        + "). Unchecked jobs will be checked automatically later."
+    )
+
+
+def _create_one(client, provider: str, label: str, messages: list[dict[str, str]], schema: dict[str, Any], name: str,
+                models: list[str], effort: str | None) -> tuple[str, str] | None:
+    """Try one key's models; None = this key is out of quota for all of them."""
     now = time.time()
-    for model in (models or MODELS):
-        if now - _exhausted.get(_quota_key(model), 0) < _EXHAUSTED_FOR:
+    for model in models:
+        if now - _exhausted.get(_quota_key(model, label), 0) < _EXHAUSTED_FOR:
+            continue
+        if provider == "nvidia":
+            got = _create_nvidia(client, label, model, messages, schema, name)
+            if got:
+                return got
             continue
         kwargs: dict[str, Any] = {
             "model": model,
@@ -419,10 +481,12 @@ def _create(client, messages: list[dict[str, str]], schema: dict[str, Any] | Non
             # Low reasoning: on the 45 test cases both gpt-oss models are 45/45 at "low" (20b at "medium"
             # used ~4x the reasoning tokens and was no more accurate).
             kwargs["reasoning_effort"] = effort or os.getenv("JF_EFFORT") or "low"
+        from groq import BadRequestError, RateLimitError
+
         for _attempt in range(6):
             try:
                 response = client.chat.completions.create(**kwargs)
-                _log_usage(name, model, response)
+                _log_usage(name, model, response, label)
                 content = response.choices[0].message.content or "{}"
                 if _empty_answer(content, name):
                     break  # this model skipped every job: let the next model answer
@@ -430,18 +494,89 @@ def _create(client, messages: list[dict[str, str]], schema: dict[str, Any] | Non
             except RateLimitError as exc:
                 msg = str(exc)
                 if "per day" in msg or "(TPD)" in msg or "(RPD)" in msg:
-                    _exhausted[_quota_key(model)] = time.time()
-                    break  # next model
+                    _exhausted[_quota_key(model, label)] = time.time()
+                    break  # next model (then the next key)
                 time.sleep(min(_wait_seconds(msg) + 1, 70))  # per-minute limit: wait and retry
             except BadRequestError as exc:
                 if "response_format" in str(exc) or "json_schema" in str(exc):
                     kwargs.update(_plain_json(messages, schema))  # no strict schema support: plain JSON
                     continue
                 raise
-    raise DailyLimitReached(
-        "Groq daily token limit reached on all models (free tier: 200k tokens/day per model). "
-        "Unchecked jobs will be checked automatically on the next run."
-    )
+            except Exception as exc:  # noqa: BLE001 — bad/revoked key (401/403): skip this key
+                if _status(exc) in (401, 403):
+                    _exhausted[_quota_key(model, label)] = time.time()
+                    break
+                raise
+    return None
+
+
+def _create_nvidia(client, label: str, model: str, messages: list[dict[str, str]], schema: dict[str, Any],
+                   name: str) -> tuple[str, str] | None:
+    """NVIDIA's OpenAI-compatible API: plain JSON (schema in the prompt), low reasoning for gpt-oss.
+    Free tier ~40 requests/minute; 429 = wait, 402/403/404 = this model or key can't be used now."""
+    msgs = _plain_json(messages, schema)["messages"]
+    if model.startswith("openai/gpt-oss"):
+        msgs = [{"role": "system", "content": "Reasoning: low"}] + msgs
+    kwargs: dict[str, Any] = {"model": model, "messages": msgs, "temperature": 0, "max_tokens": 4000,
+                              "response_format": {"type": "json_object"}}
+    for _attempt in range(5):
+        try:
+            response = client.chat.completions.create(**kwargs)
+            _log_usage(name, model, response, label)
+            content = _json_text(response.choices[0].message.content or "")
+            try:
+                json.loads(content)
+            except json.JSONDecodeError:
+                return None
+            if _empty_answer(content, name):
+                return None
+            return content, model
+        except Exception as exc:  # noqa: BLE001 — openai's error classes differ from groq's
+            code = _status(exc)
+            if code == 429:
+                time.sleep(15)
+                continue
+            if code == 400 and "response_format" in kwargs:
+                kwargs.pop("response_format")  # model without JSON mode: the prompt still asks for JSON
+                continue
+            if code in (401, 402, 403, 404, 410) or code >= 500:  # 410 = model retired
+                _exhausted[_quota_key(model, label)] = time.time()
+                return None
+            raise
+    return None
+
+
+def ask_json(prompt: str, max_tokens: int = 1500) -> dict[str, Any]:
+    """A small free-form JSON question, using the smallest model of whichever key has quota."""
+    from fresherpilot.core import users  # noqa: F401 — keys come from the current user
+
+    pool = _client()
+    messages = [{"role": "user", "content": prompt}]
+    for label, provider, api, models in pool.entries:
+        for model in reversed(models):  # smallest first: these tasks are easy
+            if time.time() - _exhausted.get(_quota_key(model, label), 0) < _EXHAUSTED_FOR:
+                continue
+            kwargs: dict[str, Any] = {"model": model, "messages": messages, "response_format": {"type": "json_object"},
+                                      "temperature": 0}
+            kwargs["max_completion_tokens" if provider == "groq" else "max_tokens"] = max_tokens
+            if model.startswith("openai/gpt-oss"):
+                if provider == "groq":
+                    kwargs["reasoning_effort"] = "low"
+                else:
+                    kwargs["messages"] = [{"role": "system", "content": "Reasoning: low"}] + messages
+            try:
+                response = api.chat.completions.create(**kwargs)
+                _log_usage("ask_json", model, response, label)
+                return json.loads(_json_text(response.choices[0].message.content or "{}"))
+            except json.JSONDecodeError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if _status(exc) in (401, 402, 403, 404, 410, 429) or "per day" in str(exc):
+                    if _status(exc) != 429:
+                        _exhausted[_quota_key(model, label)] = time.time()
+                    continue
+                raise
+    return {}
 
 
 def _judge_batch(client, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -536,7 +671,8 @@ def _board_reject(job: dict[str, Any]) -> tuple[str, str] | None:
     if job.get("source") == "LinkedIn" and re.search(r"mid-senior|director|executive", level, re.I):
         return "too_senior", f"LinkedIn level: {level}"
     m = re.match(r"\s*(\d+(?:\.\d+)?)\s*(?:-\s*\d+\s*|\+\s*)years", level)
-    if m and float(m.group(1)) >= 1:
+    # One year over the limit ("1-3 years") is a stretch job, judged by the AI; more is rejected free.
+    if m and float(m.group(1)) >= _reject_from_years() + 1:
         return "needs_experience", f"{job.get('source')} lists {level}"
     return None
 
@@ -544,6 +680,11 @@ def _board_reject(job: dict[str, Any]) -> tuple[str, str] | None:
 def prescreen(jobs: list[dict[str, Any]]) -> int:
     """Reject obvious non-fits cheaply before the full AI check. Returns how many were rejected."""
     cache = _load_cache()
+    # Jobs rejected from board data under an older rule (e.g. "1-3 years") get a real check now.
+    stale = [job_key(j) for j in jobs if (cache.get(job_key(j)) or {}).get("prescreen") == "board" and not _board_reject(j)]
+    if stale:
+        _update_cache(remove=stale)
+        cache = _load_cache()
     todo = [j for j in jobs if job_key(j) not in cache]
     add: dict[str, dict[str, Any]] = {}
     rest = []
@@ -758,25 +899,30 @@ def intern_key(job: dict[str, Any]) -> str:
 
 
 def _one_year(facts: dict[str, Any], job: dict[str, Any]) -> bool:
+    """Asks for just one year more than the limit (limit 1: "1+", "1-3 years", "1.5 years")."""
+    rf = _reject_from_years()
     years = facts.get("min_years_required")
     if isinstance(years, (int, float)):
-        return 1 <= years < 1.5
+        return rf <= years < rf + 1
     m = re.match(r"\s*(\d+)\s*-\s*\d+\s*years", str(job.get("experience") or ""))
-    return bool(m and int(m.group(1)) == 1)
+    return bool(m and int(m.group(1)) == rf)
 
 
 def _decision(job: dict[str, Any], facts: dict[str, Any], cache: dict[str, Any]) -> tuple[str, str, Any]:
     """decide() plus internship credit -> (decision, category, credit).
     credit: None (not relevant), "pending" (needs the AI check) or the saved check result."""
     decision, category = decide(facts, job)
-    if (decision, category) != ("reject", "needs_experience") or not _one_year(facts, job):
+    if (decision, category) != ("reject", "needs_experience") or not _one_year(facts, job) or facts.get("prescreen"):
         return decision, category, None
-    if not _INTERN_WORD.search(job.get("description") or ""):
-        return decision, category, None  # internships never mentioned: needs real work experience
-    rec = cache.get(intern_key(job))
-    if rec is None:
-        return decision, category, "pending"
-    return ("keep", "ok", rec) if rec.get("counts") else (decision, category, None)
+    # A one-year job is never hidden: a full keep when internships count, otherwise a "stretch"
+    # keep (freshers do get calls for these; a missed "1-3 years" Data Scientist job led to this).
+    if _INTERN_WORD.search(job.get("description") or ""):
+        rec = cache.get(intern_key(job))
+        if rec is None:
+            return decision, category, "pending"
+        if rec.get("counts"):
+            return "keep", "ok", rec
+    return "keep", "stretch", None
 
 
 def _experience_lines(text: str, limit: int = 700) -> str:

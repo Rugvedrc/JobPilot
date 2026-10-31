@@ -14,11 +14,18 @@
 
       <section class="panel step" id="step1">
         <h2><span class="num">1</span> Your API keys</h2>
-        <p class="muted small">Searches and AI checks run on your own free accounts, so nobody else's credits are used. Keys are stored encrypted with your password.</p>
-        <label class="field">Groq API key (required) <a href="https://console.groq.com/keys" target="_blank" rel="noopener">get one free</a>
+        <p class="muted small">AI checks run on your own free account, so nobody else's credits are used. Keys are stored encrypted and only used while you're signed in.</p>
+        <label class="field">Groq API key (required, free) <a href="https://console.groq.com/keys" target="_blank" rel="noopener">get one free</a>
+          <span class="muted small">Sign in at console.groq.com → API Keys → Create. Several keys? Separate them with commas.</span>
           <input id="GROQ_API_KEY" type="password" autocomplete="off" placeholder="gsk_…" /></label>
-        <label class="field">Apify API token (required for job searches) <a href="https://console.apify.com/settings/integrations" target="_blank" rel="noopener">get one free</a>
-          <input id="APIFY_API_KEY" type="password" autocomplete="off" placeholder="apify_api_…" /></label>
+        <details><summary class="link-btn">Optional: Naukri jobs (Apify) and a backup AI key (NVIDIA)</summary>
+          <p class="muted small">LinkedIn, Indeed, Internshala, Wellfound, company career pages and Telegram are searched for free.
+            Naukri needs an Apify token (free $5/month covers it).</p>
+          <label class="field">Apify API token <a href="https://console.apify.com/settings/integrations" target="_blank" rel="noopener">get one free</a>
+            <input id="APIFY_API_KEY" type="password" autocomplete="off" placeholder="apify_api_…" /></label>
+          <label class="field">NVIDIA API key (used when Groq's daily limit is reached) <a href="https://build.nvidia.com/settings/api-keys" target="_blank" rel="noopener">get one</a>
+            <input id="NVIDIA_API_KEY" type="password" autocomplete="off" placeholder="nvapi-…" /></label>
+        </details>
         <details><summary class="link-btn">Optional: Gmail sending</summary>
           <label class="field">Gmail address<input id="GMAIL_ADDRESS" autocomplete="off" /></label>
           <label class="field">Gmail app password <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">create</a>
@@ -53,7 +60,8 @@
         </div>
         <label class="field">Skills<textarea id="skills" rows="3"></textarea></label>
         <label class="field">Job titles to search (Naukri / Indeed / Internshala)<textarea id="roles" rows="2"></textarea></label>
-        <label class="field">LinkedIn searches (up to 6; each costs Apify credit)<input id="linkedin_titles" /></label>
+        <label class="field">LinkedIn searches (up to 6 job titles, free)<input id="linkedin_titles" /></label>
+        <label class="field">Cities (comma-separated; add "Remote" for remote jobs; empty = all of India)<input id="locations" placeholder="e.g. Pune, Bengaluru, Remote" /></label>
         <label class="field">Technologies you DON'T work with (jobs with these in the title are skipped for free)<textarea id="off_stack" rows="2"></textarea></label>
         <div class="row"><button class="btn primary" id="finish">Save and find jobs</button><span class="small" id="finishMsg"></span></div>
       </section>
@@ -61,7 +69,7 @@
     <script src="/static/account.js"></script>
     <script>
       let draft = null;
-      const LISTS = ["skills", "roles", "linkedin_titles", "off_stack"];
+      const LISTS = ["skills", "roles", "linkedin_titles", "off_stack", "locations"];
       $("analyse").onclick = async () => {
         const fd = new FormData();
         const f = $("resume").files[0];
@@ -102,9 +110,12 @@
         const parts = profile.personal.full_name.split(/\s+/);
         profile.personal.first_name = profile.personal.first_name || parts[0] || "";
         profile.personal.last_name = profile.personal.last_name || parts.slice(1).join(" ");
+        if (!(await fetch("/api/me").then((r) => r.json())).keys.GROQ_API_KEY)
+          return msg("finishMsg", "Add your Groq key in step 1 (and press Save keys) first.", true);
         msg("finishMsg", "Saving…");
         const res = await fetch("/api/onboarding/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile, prefs }) });
         if (!res.ok) return msg("finishMsg", "Couldn't save", true);
+        await fetch("/api/fetch", { method: "POST" }).catch(() => {});
         location.href = "/#jobs";
       };
       loadKeys();

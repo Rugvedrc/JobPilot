@@ -1,4 +1,7 @@
-"""Fetch jobs from Naukri, LinkedIn, Indeed, Cutshort and Wellfound via Apify.
+"""Fetch jobs from Naukri, LinkedIn, Indeed, Internshala, Wellfound, company career pages and Telegram.
+
+LinkedIn, Indeed, career pages and Telegram are free (free_boards.py / ats_jobs.py); Apify is used for
+Naukri, Internshala and Wellfound, and for LinkedIn / Indeed only when their free fetch fails.
 
 What is searched lives in search_config.py. Each fetch is MERGED into the saved list
 (boards in "only new jobs" mode return only what's new), and jobs are kept for
@@ -7,6 +10,7 @@ KEEP_JOBS_DAYS after they were first seen.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -282,6 +286,45 @@ def normalize_indeed(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _submit(pool: ThreadPoolExecutor, fn: Callable[..., Any], *args: Any):
+    """pool.submit that keeps the signed-in user (prefs, keys, files) in the worker thread."""
+    return pool.submit(contextvars.copy_context().run, fn, *args)
+
+
+def _ctx_map(pool: ThreadPoolExecutor, fn: Callable[..., Any], items: list[Any]) -> list[Any]:
+    return [f.result() for f in [_submit(pool, fn, x) for x in items]]
+
+
+_GOOGLE_ROTATION = [0]  # which city each role searches this run (changes every run)
+
+
+def normalize_google(item: dict[str, Any]) -> dict[str, Any] | None:
+    """A Google Jobs result (litescrape/google-jobs dataset row). No full description: title, company,
+    place, posted age and the site it was listed on."""
+    d = item.get("data") or {}
+    if item.get("group") not in (None, "jobs_results") or not d.get("title"):
+        return None
+    via = str(d.get("via") or "").removeprefix("via ").strip()
+    types = ", ".join(d.get("employment_types") or []).replace("\u2013", "-")
+    return {
+        "id": str(d.get("job_id") or d.get("link")),
+        "source": "Google",
+        "title": strip_html(str(d["title"])),
+        "company": d.get("company_name") or "Unknown",
+        "location": d.get("location") or "",
+        "experience": "Not specified",
+        "salary": "Not disclosed",
+        "posted": d.get("posted") or "",
+        "posted_days": _posted_days_from_text(d.get("posted")),
+        "skills": [],
+        "url": d.get("link") or item.get("url") or "",
+        "description": (f"Listed on {via} (found through Google Jobs; open the link for the full description "
+                        f"and apply options).") if via else "",
+        "work_type": types.replace("Full–time", "Full-time"),
+        "listed_on": via,
+    }
+
+
 # Apify's free plan runs at most 5 actors at once: more are queued here instead of failing.
 _ACTOR_SLOTS = threading.BoundedSemaphore(4)
 
@@ -344,40 +387,78 @@ _FREE_STATS: dict[str, dict[str, Any]] = {}  # boards whose jobs come back alrea
 
 
 def _apify_allowance(old: dict[str, Any], now: datetime) -> float:
-    """USD all boards together may spend on Apify today (minus what earlier fetches today spent)."""
+    """USD all boards together may still spend on Apify today.
+
+    Uses Apify's own numbers: credit left at the start of today / days left in the cycle, minus what
+    the account already spent today. Apify counts every run made with this key (test copies of the
+    app too), so the month's $5 can't be used up early by runs this file doesn't know about."""
+    local_spent = (old.get("apify_spend") or {}).get(now.astimezone().date().isoformat(), 0.0)
     if cfg.APIFY_USD_PER_DAY is not None:
-        daily = float(cfg.APIFY_USD_PER_DAY)
-    else:
+        return max(0.0, float(cfg.APIFY_USD_PER_DAY) - local_spent)
+    try:
+        import requests
+
+        headers = {"Authorization": f"Bearer {_api_token()}"}
+        d = requests.get("https://api.apify.com/v2/users/me/limits", headers=headers, timeout=20).json()["data"]
+        left = d["limits"]["maxMonthlyUsageUsd"] - d["current"]["monthlyUsageUsd"]
+        end = datetime.fromisoformat(d["monthlyUsageCycle"]["endAt"].replace("Z", "+00:00"))
+        days_left = max(1, (end - now).days + 1)
+        spent_today = local_spent
         try:
-            import requests
-
-            d = requests.get("https://api.apify.com/v2/users/me/limits", headers={"Authorization": f"Bearer {_api_token()}"},
-                             timeout=20).json()["data"]
-            left = d["limits"]["maxMonthlyUsageUsd"] - d["current"]["monthlyUsageUsd"]
-            end = datetime.fromisoformat(d["monthlyUsageCycle"]["endAt"].replace("Z", "+00:00"))
-            days_left = max(1, (end - now).days + 1)
-            daily = max(0.0, left / days_left)
-        except Exception:  # noqa: BLE001 — unknown credit: be careful
-            daily = 0.1
-    spent = (old.get("apify_spend") or {}).get(now.astimezone().date().isoformat(), 0.0)
-    return max(0.0, daily - spent)
+            usage = requests.get("https://api.apify.com/v2/users/me/usage/monthly", headers=headers, timeout=20).json()["data"]
+            today = now.date().isoformat()  # Apify's days are UTC
+            spent_today = next((float(x.get("totalUsageCreditsUsd") or 0) for x in usage.get("dailyServiceUsages") or []
+                                if str(x.get("date", ""))[:10] == today), 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+        return max(0.0, (left + spent_today) / days_left - spent_today)
+    except Exception:  # noqa: BLE001 — unknown credit: be careful
+        return max(0.0, 0.1 - local_spent)
 
 
-def _run_linkedin(name: str, conf: dict[str, Any], hours: float, old: dict[str, Any], now: datetime, cap: float
-                  ) -> tuple[str, list[dict[str, Any]], str | None, float | None]:
-    """LinkedIn on Apify only (valig, ~$0.0004/job): each title is its own search, run in two rounds of
-    three; jobs fetched before (or by the first round) are skipped and not charged."""
+def _run_linkedin(name: str, conf: dict[str, Any], hours: float, old: dict[str, Any], now: datetime, cap: float,
+                  use_apify: bool = True) -> tuple[str, list[dict[str, Any]], str | None, float | None]:
+    """LinkedIn's public job search first (free). Searches it couldn't finish (rate limit) go to Apify
+    (valig, ~$0.0004/job) in two rounds; jobs fetched before are skipped and not charged."""
     from fresherpilot.core import users
+    from fresherpilot.jobs import free_boards, llm_filter
 
     titles = list(users.prefs()["linkedin_titles"])
     cities, remote = _locations()
     # One search per title and city (LinkedIn takes one location per search); remote = India + remote filter.
     places = cities + (["Remote"] if remote else []) if (cities or remote) else ["India"]
-    searches = [(t, p) for t in titles for p in places]
+    all_searches = [(t, p) for t in titles for p in places]
+    # Searches the last fetch didn't reach go first, so no search is starved by the time limit.
+    pending_file = users.path("linkedin_pending.json")
+    try:
+        pending = [tuple(x) for x in json.loads(pending_file.read_text(encoding="utf-8"))]
+    except (OSError, ValueError, TypeError):
+        pending = []
+    all_searches = [s for s in pending if s in all_searches] + [s for s in all_searches if s not in pending]
+    known = {str(j.get("id")) for j in old.get("jobs") or [] if j.get("source") == "LinkedIn"}
     seen = {str(j.get("id")) for j in old.get("jobs") or [] if j.get("source") == "LinkedIn"
             and (j.get("first_seen") or "") >= (now - timedelta(days=5)).isoformat()}
-    base = _input_for(name, conf, hours)
     jobs: dict[str, dict[str, Any]] = {}
+    free_stats: dict[str, Any] = {}
+    try:
+        free = free_boards.linkedin(all_searches, hours, known, lambda t: llm_filter.title_excluded(t) is None,
+                                    minutes=cfg.LINKEDIN_FREE_MINUTES)
+        jobs.update({j["id"]: j for j in free["jobs"]})
+        searches = [x for x in all_searches if x not in free["done"]]
+        free_stats = {"free_jobs": len(free["jobs"]), "free_title_skipped": free["skipped_title"]}
+        if free["blocked"]:
+            free_stats["free_blocked"] = free["blocked"]
+    except Exception as exc:  # noqa: BLE001 — free fetch broke: Apify does all searches
+        searches = all_searches
+        free_stats = {"free_error": str(exc)[:200]}
+    not_done = len(searches)
+    try:
+        pending_file.write_text(json.dumps([list(s) for s in searches]), encoding="utf-8")
+    except OSError:
+        pass
+    if not use_apify or cfg.LINKEDIN_FREE_ONLY:
+        searches = []
+    base = _input_for(name, conf, hours)
     cost, failed = 0.0, []
     half = (len(searches) + 1) // 2
     for wave in (searches[:half], searches[half:]):
@@ -391,8 +472,10 @@ def _run_linkedin(name: str, conf: dict[str, Any], hours: float, old: dict[str, 
             label = title if place == "India" else f"{title} @ {place}"
             return label, _run_actor(name, conf["actor"], run_input, max(cfg.MIN_RUN_USD, cap / max(1, len(searches))))
 
+        if not wave:
+            continue
         with ThreadPoolExecutor(max_workers=3) as pool:
-            for title, (_, items, error, c) in pool.map(one, wave):
+            for title, (_, items, error, c) in _ctx_map(pool, one, wave):
                 cost += c or 0.0
                 if error:
                     failed.append((title, error))
@@ -400,12 +483,18 @@ def _run_linkedin(name: str, conf: dict[str, Any], hours: float, old: dict[str, 
                     job = normalize_linkedin(item)
                     if job:
                         jobs.setdefault(job["id"], job)
-    stats: dict[str, Any] = {"searches": [t if p == "India" else f"{t} @ {p}" for t, p in searches], "apify_jobs": len(jobs)}
+    stats: dict[str, Any] = {"searches": [t if p == "India" else f"{t} @ {p}" for t, p in all_searches],
+                             "apify_searches": len(searches), **free_stats,
+                             "apify_jobs": len(jobs) - free_stats.get("free_jobs", 0)}
     if failed:
         stats["apify_failed"] = [t for t, _ in failed]
     _FREE_STATS[name] = stats
     _LINKEDIN_SPEND[0] = cost
     error = None if jobs or not failed else failed[0][1]
+    left = not_done if not use_apify or cfg.LINKEDIN_FREE_ONLY else len(failed)
+    if left and not error:  # keep LinkedIn's "last fetched" time, so the next fetch covers these searches
+        error = (f"{left} of {len(all_searches)} LinkedIn searches left for the next fetch "
+                 f"(LinkedIn's free search is rate-limited; {len(jobs)} jobs fetched)")
     return name, list(jobs.values()), error, cost
 
 
@@ -418,6 +507,59 @@ def _spend_log(old: dict[str, Any], now: datetime, spent: float) -> dict[str, fl
     day = now.astimezone().date().isoformat()
     log[day] = round(log.get(day, 0.0) + spent, 4)
     return {d: v for d, v in sorted(log.items())[-7:]}
+
+
+def _run_indeed(name: str, conf: dict[str, Any], hours: float, cap: float, use_apify: bool = True
+                ) -> tuple[str, list[dict[str, Any]], str | None, float | None]:
+    """Indeed free via python-jobspy; Apify only if that fails."""
+    from fresherpilot.core import users
+    from fresherpilot.jobs import free_boards
+
+    cities, remote = _locations()
+    places = cities + (["Remote"] if remote else []) if (cities or remote) else ["India"]
+    try:
+        jobs = free_boards.indeed(list(users.prefs()["roles"]), places, hours)
+        _FREE_STATS[name] = {"free_jobs": len(jobs)}
+        return name, jobs, None, 0.0
+    except Exception as exc:  # noqa: BLE001
+        if not use_apify:
+            return name, [], f"Free Indeed fetch failed ({exc}) and there is no Apify credit left today", 0.0
+        _FREE_STATS[name] = {"fallback": f"free fetch failed: {str(exc)[:150]}"}
+        return _run_actor(name, conf["actor"], _input_for(name, conf, hours), cap)
+
+
+def _run_naukri(name: str, conf: dict[str, Any], hours: float, cap: float
+                ) -> tuple[str, list[dict[str, Any]], str | None, float | None]:
+    """One run per experience value (search_config.NAUKRI_EXPERIENCE_PASSES), each with its own
+    "only new jobs" state."""
+    base = _input_for(name, conf, hours)
+    passes = list(cfg.NAUKRI_EXPERIENCE_PASSES) or [base.get("experience", "0")]
+    shares = [0.6, 0.4] if len(passes) == 2 else [1 / len(passes)] * len(passes)
+    items: list[dict[str, Any]] = []
+    cost, errors = 0.0, []
+    for exp, share in zip(passes, shares):
+        # pass "0" keeps the original state key, so its history from before this change still counts
+        state = base["stateKey"] if exp == "0" else f"{base['stateKey']}-exp{exp}"
+        _, got, err, c = _run_actor(name, conf["actor"], {**base, "experience": exp, "stateKey": state},
+                                    max(cfg.MIN_RUN_USD, cap * share))
+        items += got
+        cost += c or 0.0
+        if err:
+            errors.append(f"experience {exp}: {err}")
+    return name, items, (None if items or not errors else "; ".join(errors)), cost
+
+
+def _run_telegram(name: str, hours: float) -> tuple[str, list[dict[str, Any]], str | None, float | None]:
+    """Public Telegram job channels from the user's settings (free)."""
+    from fresherpilot.jobs import free_boards
+
+    channels = [str(c) for c in _prefs().get("telegram_channels") or [] if str(c).strip()]
+    try:
+        jobs, errs = free_boards.telegram(channels, hours)
+        _FREE_STATS[name] = {"channels": len(channels), **({"problems": errs[:5]} if errs else {})}
+        return name, jobs, ("; ".join(errs[:3]) if errs and not jobs else None), 0.0
+    except Exception as exc:  # noqa: BLE001
+        return name, [], str(exc), None
 
 
 def _run_careers(name: str, hours: float) -> tuple[str, list[dict[str, Any]], str | None, float | None]:
@@ -438,7 +580,11 @@ SOURCES: dict[str, tuple[dict[str, Any], Callable[[dict[str, Any]], dict[str, An
     "wellfound": (cfg.WELLFOUND, normalize_wellfound),
     "internshala": (cfg.INTERNSHALA, normalize_internshala),
     "careers": (cfg.CAREERS, lambda job: job),
+    "telegram": (cfg.TELEGRAM, lambda job: job),
+    "google": (cfg.GOOGLE_JOBS, normalize_google),
 }
+FREE_RUNNERS = {"careers", "telegram"}        # never use Apify
+FREE_FIRST = {"linkedin", "indeed"}           # free fetch, Apify only as a fallback
 
 
 def _hours_since(iso: str | None, now: datetime) -> float | None:
@@ -455,7 +601,15 @@ def _window_hours(name: str, last_fetch: dict[str, str], now: datetime) -> float
     full = cfg.POSTED_WITHIN_DAYS * 24
     if name == "careers":  # company pages keep openings up for weeks: the first fetch looks further back
         full = cfg.CAREERS_FIRST_DAYS * 24 if since is None else full
+    if name == "telegram":
+        full = cfg.TELEGRAM_FIRST_DAYS * 24
     return full if since is None else max(6.0, min(full, since + 2))
+
+
+def _prefs() -> dict[str, Any]:
+    from fresherpilot.core import users
+
+    return users.prefs()
 
 
 def _locations() -> tuple[list[str], bool]:
@@ -529,6 +683,12 @@ def _input_for(name: str, conf: dict[str, Any], hours: float | None = None) -> d
         run_input["freshness"] = 1 if days <= 1 else (3 if days <= 3 else 7)
     elif name == "wellfound":
         run_input["postedWithinDays"] = min(days, cfg.POSTED_WITHIN_DAYS)
+    if name == "google":  # one search per role; the city rotates with each run so all pairs get covered
+        places = cities + (["Remote"] if remote else []) if (cities or remote) else ["India"]
+        shift = _GOOGLE_ROTATION[0]
+        run_input["requests"] = [{"q": f"{role} jobs in {places[(i + shift) % len(places)]}" if places[(i + shift) % len(places)] != "Remote"
+                                  else f"remote {role} jobs India"} for i, role in enumerate(prefs["roles"][:10])]
+        run_input["maxRequests"] = len(run_input["requests"])
     return run_input
 
 
@@ -561,6 +721,17 @@ def fetch_latest_jobs(progress: Callable[[int, int, list[str]], None] | None = N
         last_day = datetime.fromisoformat(last_fetch["wellfound"]).astimezone().date()
         if last_day == now.astimezone().date() or since_wf < cfg.WELLFOUND_MIN_GAP_HOURS:
             active.pop("wellfound")
+    # Google Jobs: the free plan allows 25 searches a day for this actor (10 per fetch).
+    runs = [t for t in (old.get("google_runs") or []) if t[:10] == now.date().isoformat()]
+    since_google = _hours_since(runs[-1], now) if runs else None
+    _GOOGLE_ROTATION[0] = len(old.get("google_runs_all") or [])
+    if len(runs) >= cfg.GOOGLE_RUNS_PER_DAY or (since_google is not None and since_google < cfg.GOOGLE_MIN_GAP_HOURS):
+        active.pop("google", None)
+    if cfg.LIVE_POLLER:  # read all the time by the live poller instead
+        for n in cfg.LIVE_BOARDS:
+            active.pop(n, None)
+    for n in [n for n in active if n not in FREE_RUNNERS | FREE_FIRST | cfg.LIVE_BOARDS | cfg.APIFY_BOARDS]:
+        active.pop(n)  # Apify-only boards that aren't allowed to spend credit (e.g. Google Jobs)
     windows = {name: _window_hours(name, last_fetch, now) for name in active}
     budget = _apify_allowance(old, now)
     caps = {name: min(conf.get("max_charge_usd", 1.0), max(cfg.MIN_RUN_USD, budget * cfg.BUDGET_SHARE.get(name, 0.1)))
@@ -569,12 +740,26 @@ def fetch_latest_jobs(progress: Callable[[int, int, list[str]], None] | None = N
         active.pop("wellfound")
         caps.pop("wellfound")
 
-    with ThreadPoolExecutor(max_workers=len(active)) as pool:
+    # No Apify credit left today: paid-only boards wait (a run would fail or eat tomorrow's share);
+    # LinkedIn / Indeed still run free. Naukri is then covered by the extension's Naukri sweep.
+    has_apify = bool(_api_token()) and budget >= cfg.MIN_RUN_USD
+    no_credit = [] if has_apify else [n for n in list(active) if n not in FREE_RUNNERS | FREE_FIRST]
+    for n in no_credit:
+        active.pop(n)
+        caps.pop(n, None)
+        windows.pop(n, None)
+    if not _prefs().get("telegram_channels"):
+        active.pop("telegram", None)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(active))) as pool:
         _FREE_STATS.clear()
         futures = [
-            pool.submit(_run_careers, name, windows[name]) if conf.get("runner") == "careers" else
-            pool.submit(_run_linkedin, name, conf, windows[name], old, now, caps[name]) if name == "linkedin" else
-            pool.submit(_run_actor, name, conf["actor"], _input_for(name, conf, windows[name]), caps[name])
+            _submit(pool, _run_careers, name, windows[name]) if name == "careers" else
+            _submit(pool, _run_telegram, name, windows[name]) if name == "telegram" else
+            _submit(pool, _run_linkedin, name, conf, windows[name], old, now, caps[name], has_apify) if name == "linkedin" else
+            _submit(pool, _run_indeed, name, conf, windows[name], caps[name], has_apify) if name == "indeed" else
+            _submit(pool, _run_naukri, name, conf, windows[name], caps[name]) if name == "naukri" else
+            _submit(pool, _run_actor, name, conf["actor"], _input_for(name, conf, windows[name]), caps[name])
             for name, (conf, _) in active.items()
         ]
         pending = list(active)
@@ -614,6 +799,10 @@ def fetch_latest_jobs(progress: Callable[[int, int, list[str]], None] | None = N
             if not in_wanted_location(job):  # before the AI check: no Groq tokens spent on it
                 r["other_city"] += 1
                 continue
+            if name == "google" and (job.get("posted_days") or 0) > max(1, windows[name] / 24 + 1):
+                r.setdefault("too_old", 0)
+                r["too_old"] += 1
+                continue
             key = _dedupe_key(job)
             if key in seen:
                 r["duplicates"] += 1
@@ -645,13 +834,110 @@ def fetch_latest_jobs(progress: Callable[[int, int, list[str]], None] | None = N
         "apify_budget_today": round(budget, 3),
         "raw_counts": {name: len(items) for name, items in raw.items() if name in active},
         "skipped_sources": [n for n in SOURCES if n not in active],
+        "no_apify_credit": no_credit,
+        "google_runs": runs + ([now.isoformat()] if "google" in active and "google" not in errors else []),
+        "google_runs_all": ((old.get("google_runs_all") or []) + ([now.isoformat()] if "google" in active else []))[-50:],
         "fetch_report": report,
         "new_this_fetch": new_count,
         "errors": errors,
         "jobs": jobs,
     }
-    _cache_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with _CACHE_LOCK:
+        latest = load_cache() or {}
+        for job in latest.get("jobs") or []:
+            if job.get("via") in ("extension", "manual", "live") and _dedupe_key(job) not in seen:
+                seen.add(_dedupe_key(job))
+                jobs.append(job)
+        payload["extension_sweeps"] = latest.get("extension_sweeps") or old.get("extension_sweeps") or {}
+        _cache_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
+
+
+_CACHE_LOCK = threading.RLock()
+
+
+# ---------------------------------------------------------------- jobs sent in by the browser extension
+
+_NAUKRI_ID = re.compile(r"-(\d{9,})(?:[?#/]|$)")
+
+
+def normalize_naukri_card(item: dict[str, Any]) -> dict[str, Any] | None:
+    """A job card read from a Naukri search page by the extension (title, company, exp, ...)."""
+    title = strip_html(str(item.get("title") or "")).strip()
+    url = str(item.get("url") or "").split("?")[0]
+    if not title or "naukri.com" not in url:
+        return None
+    m = _NAUKRI_ID.search(url)
+    jid = str(item.get("id") or (m.group(1) if m else url))
+    exp = re.sub(r"\s*Yrs?\b", " years", str(item.get("experience") or "")).strip()
+    return {
+        "id": jid,
+        "source": "Naukri",
+        "title": title,
+        "company": strip_html(str(item.get("company") or "")).strip() or "Unknown",
+        "location": str(item.get("location") or ""),
+        "experience": exp or "Not specified",
+        "salary": str(item.get("salary") or "") or "Not disclosed",
+        "posted": str(item.get("posted") or ""),
+        "posted_days": _posted_days_from_text(item.get("posted")),
+        "skills": [str(x) for x in item.get("skills") or []][:20],
+        "url": url,
+        "description": strip_html(str(item.get("description") or "")),
+        "work_type": "",
+        "via": "extension",
+    }
+
+
+def merge_external(items: list[dict[str, Any]], kind: str, check_location: bool = True) -> dict[str, int]:
+    """Add jobs from outside a fetch to the saved list (dedupe like a fetch): "naukri" = cards the
+    extension read in the user's browser, "manual" = a job the user reported as missed."""
+    normalize = {"naukri": normalize_naukri_card, "manual": lambda j: j, "live": lambda j: {**j, "via": "live"}}[kind]
+    now = datetime.now(timezone.utc)
+    with _CACHE_LOCK:
+        payload = load_cache() or {"jobs": [], "fetched_at": now.isoformat()}
+        jobs = payload.get("jobs") or []
+        keys = {_dedupe_key(j) for j in jobs}
+        added = dupes = other_city = 0
+        for item in items:
+            job = normalize(item)
+            if not job:
+                continue
+            if check_location and not in_wanted_location(job):
+                other_city += 1
+                continue
+            key = _dedupe_key(job)
+            if key in keys:
+                dupes += 1
+                continue
+            keys.add(key)
+            jobs.append(_stamp(job, now))
+            added += 1
+        payload["jobs"] = jobs
+        if kind == "naukri":
+            payload.setdefault("extension_sweeps", {})[kind] = {"at": now.isoformat(), "added": added}
+        payload["new_this_fetch"] = (payload.get("new_this_fetch") or 0) + added
+        _cache_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return {"added": added, "duplicates": dupes, "other_city": other_city}
+
+
+def naukri_sweep_plan() -> dict[str, Any]:
+    """Naukri search pages for the extension to read in the user's own browser (free, no Apify).
+    Every role, experience 0 and 1 (so "1-3 years" jobs come in too), the user's cities (+ Remote),
+    newest first, posted since the last sweep (1, 3 or 7 days)."""
+    prefs = _prefs()
+    cities, remote = _locations()
+    payload = load_cache() or {}
+    last = ((payload.get("extension_sweeps") or {}).get("naukri") or {}).get("at")
+    hours = _hours_since(last, datetime.now(timezone.utc))
+    age = 1 if hours is not None and hours < 22 else (3 if hours is None or hours < 70 else 7)
+    loc = ", ".join([c.lower() for c in cities] + (["remote"] if remote else []))
+    urls = []
+    for role in prefs["roles"]:
+        slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")
+        for exp in cfg.NAUKRI_EXPERIENCE_PASSES:
+            q = f"k={quote_plus(role)}&experience={exp}&jobAge={age}" + (f"&l={quote_plus(loc)}" if loc else "")
+            urls.append(f"https://www.naukri.com/{slug}-jobs?{q}")
+    return {"urls": urls, "max_pages": 5, "gap_seconds": [4, 8], "job_age_days": age}
 
 
 def load_cache() -> dict[str, Any] | None:

@@ -15,8 +15,9 @@
 
       <section class="panel">
         <h2>API keys</h2>
-        <p class="muted small">Stored encrypted with your password; only usable while you're logged in.</p>
-        <label class="field">Groq API key<input id="GROQ_API_KEY" type="password" autocomplete="off" /></label>
+        <p class="muted small">Stored encrypted; only usable while you're logged in. Your own keys: their use is between you and each provider.</p>
+        <label class="field">Groq API key(s), one or more, comma-separated: used in order, the next takes over when one hits its daily limit<input id="GROQ_API_KEY" type="password" autocomplete="off" /></label>
+        <label class="field">NVIDIA API key (optional, build.nvidia.com): last fallback when every Groq key is used up<input id="NVIDIA_API_KEY" type="password" autocomplete="off" placeholder="nvapi-…" /></label>
         <label class="field">Apify API token<input id="APIFY_API_KEY" type="password" autocomplete="off" /></label>
         <label class="field">Gmail address<input id="GMAIL_ADDRESS" autocomplete="off" /></label>
         <label class="field">Gmail app password<input id="GMAIL_APP_PASSWORD" type="password" autocomplete="off" /></label>
@@ -34,14 +35,51 @@
         </div>
         <label class="field">Job titles to search<textarea id="roles" rows="2"></textarea></label>
         <label class="field">LinkedIn searches (up to 6)<input id="linkedin_titles" /></label>
-        <label class="field">Cities (e.g. Pune, Bangalore, Remote; empty = all India; fewer cities = less Apify credit, but each extra city adds LinkedIn searches)<input id="locations" /></label>
+        <label class="field">Cities (e.g. Pune, Bangalore, Remote; empty = all India; each extra city adds LinkedIn searches)<input id="locations" /></label>
+        <label class="field">Telegram job channels (public channel names or t.me links, e.g. FreshersJobsUpdates, t.me/gocareers; free)<input id="telegram_channels" /></label>
         <label class="field">Technologies you don't work with<textarea id="off_stack" rows="2"></textarea></label>
         <label class="field">Skills (empty = read from your resume)<textarea id="skills" rows="3"></textarea></label>
         <div class="row"><button class="btn primary" id="savePrefs">Save search settings</button>
           <a class="link-btn" href="/onboarding">Upload a new resume…</a><span class="small" id="prefsMsg"></span></div>
       </section>
 
+      <section class="panel" id="consentPanel" hidden>
+        <h2>Updated terms</h2>
+        <p class="muted small">Please read the updated <a href="/terms" target="_blank">Terms</a> and
+          <a href="/privacy" target="_blank">Privacy Policy</a>.</p>
+        <div class="row"><button class="btn primary" id="acceptTerms">I agree</button><span class="small" id="consentMsg"></span></div>
+      </section>
+
+      <section class="panel" id="invitePanel" hidden>
+        <h2>Invites (owner)</h2>
+        <p class="muted small">Only these emails can create an account (with Google). One per line or comma-separated.
+          Removing an email stops new sign-ups; remove a member below to end their access.</p>
+        <label class="field">Invited emails<textarea id="invites" rows="4"></textarea></label>
+        <div class="row"><button class="btn primary" id="saveInvites">Save invites</button><span class="small" id="invitesMsg"></span></div>
+        <h3 style="margin:18px 0 6px;font-size:0.95rem">Members</h3>
+        <div id="members" class="small"></div>
+      </section>
+
       <section class="panel">
+        <h2>Sign-in</h2>
+        <p class="small" id="googleState"></p>
+        <div id="googleLink"></div>
+        <span class="small" id="googleMsg"></span>
+      </section>
+
+      <section class="panel">
+        <h2>Your data</h2>
+        <p class="muted small">Download everything stored for your account (profile, resume, jobs, AI results,
+          applications, messages log), or delete your account and all its data for good.
+          See the <a href="/privacy" target="_blank">Privacy Policy</a>.</p>
+        <div class="row"><a class="btn" href="/api/account/export">Download my data (.zip)</a></div>
+        <div class="row" id="deleteRow" style="margin-top:12px">
+          <input id="deleteConfirm" placeholder='Type DELETE to confirm' style="max-width:220px" />
+          <button class="btn" id="deleteAccount" style="color:var(--bad)">Delete my account</button>
+          <span class="small" id="deleteMsg"></span></div>
+      </section>
+
+      <section class="panel" id="passwordPanel">
         <h2>Password</h2>
         <div class="grid2">
           <label class="field">Current password<input id="oldPw" type="password" autocomplete="current-password" /></label>
@@ -52,14 +90,96 @@
     </main>
     <script src="/static/account.js"></script>
     <script>
-      const LISTS = ["skills", "roles", "linkedin_titles", "off_stack", "locations"];
+      const LISTS = ["skills", "roles", "linkedin_titles", "off_stack", "locations", "telegram_channels"];
       loadKeys().then((me) => {
         if (!me) return;
         $("who").textContent = `Signed in as ${me.user.username}${me.user.owner ? " (owner)" : ""}`;
         const s = me.prefs;
         for (const k of ["headline", "summary", "target_area", "experience_years", "reject_from_years"]) $(k).value = s[k] ?? "";
         for (const k of LISTS) $(k).value = (s[k] || []).map((x) => x.trim()).join(", ");
+        setupAccount(me);
       });
+
+      function setupAccount(me) {
+        const u = me.user;
+        $("consentPanel").hidden = !me.needs_consent;
+        $("passwordPanel").hidden = !u.has_password;
+        $("googleState").textContent = u.google ? `Google sign-in is on (${u.email}).`
+          : me.google_client_id ? "Link your Google account to sign in with it too." : "Google sign-in isn't set up on this server.";
+        if (u.owner) { $("deleteRow").hidden = true; loadInvites(); }
+        if (!u.google && me.google_client_id) {
+          const script = document.createElement("script");
+          script.src = "https://accounts.google.com/gsi/client";
+          script.async = true;
+          script.onload = () => {
+            google.accounts.id.initialize({ client_id: me.google_client_id, callback: async (r) => {
+              const res = await fetch("/api/account/google", { method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ credential: r.credential }) });
+              const d = await res.json().catch(() => ({}));
+              msg("googleMsg", res.ok ? "Google linked ✓" : d.detail || "Couldn't link Google", !res.ok);
+              if (res.ok) { $("googleLink").hidden = true; $("googleState").textContent = `Google sign-in is on (${d.user.email}).`; }
+            } });
+            google.accounts.id.renderButton($("googleLink"), { theme: "outline", size: "medium", text: "signin_with" });
+          };
+          document.head.appendChild(script);
+        }
+      }
+
+      function renderMembers(list) {
+        const box = $("members");
+        box.innerHTML = "";
+        for (const m of list) {
+          const row = document.createElement("div");
+          row.className = "row";
+          row.style.cssText = "justify-content:space-between;border-top:1px solid var(--line);padding:6px 0";
+          const who = document.createElement("span");
+          who.textContent = `${m.username}${m.email ? " · " + m.email : ""}${m.owner ? " (owner)" : ""}`;
+          row.appendChild(who);
+          if (!m.owner) {
+            const btn = document.createElement("button");
+            btn.className = "link-btn";
+            btn.textContent = "Remove";
+            btn.onclick = async () => {
+              if (!confirm(`Remove ${m.username} and delete all their data?`)) return;
+              const res = await fetch(`/api/admin/users/${encodeURIComponent(m.id)}`, { method: "DELETE" });
+              if (res.ok) renderMembers((await res.json()).users);
+            };
+            row.appendChild(btn);
+          }
+          box.appendChild(row);
+        }
+      }
+
+      async function loadInvites() {
+        const res = await fetch("/api/admin/invites");
+        if (!res.ok) return;
+        const d = await res.json();
+        $("invitePanel").hidden = false;
+        $("invites").value = d.emails.join("\n");
+        renderMembers(d.users);
+      }
+
+      $("saveInvites").onclick = async () => {
+        const emails = $("invites").value.split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean);
+        const res = await fetch("/api/admin/invites", { method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ emails }) });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok) { $("invites").value = d.emails.join("\n"); renderMembers(d.users); }
+        msg("invitesMsg", res.ok ? `Saved ✓ (${d.emails.length} invited)` : d.detail || "Couldn't save", !res.ok);
+      };
+      $("acceptTerms").onclick = async () => {
+        const res = await fetch("/api/account/consent", { method: "POST" });
+        if (res.ok) $("consentPanel").hidden = true;
+        else msg("consentMsg", "Couldn't save", true);
+      };
+      $("deleteAccount").onclick = async () => {
+        if ($("deleteConfirm").value !== "DELETE") return msg("deleteMsg", "Type DELETE first.", true);
+        const res = await fetch("/api/account/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirm: "DELETE" }) });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok) location.href = "/login";
+        else msg("deleteMsg", d.detail || "Couldn't delete", true);
+      };
       $("savePrefs").onclick = async () => {
         const prefs = {};
         for (const k of ["headline", "summary", "target_area"]) prefs[k] = $(k).value.trim();

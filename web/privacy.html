@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FresherPilot · Privacy Policy</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <style>
+      .doc { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; line-height: 1.6; }
+      .doc h1 { margin-bottom: 4px; }
+      .doc h2 { margin-top: 28px; font-size: 1.1rem; }
+      .doc table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+      .doc th, .doc td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+    </style>
+  </head>
+  <body>
+    <main class="doc">
+      <p><a href="/">← FresherPilot</a></p>
+      <h1>Privacy Policy</h1>
+      <p class="muted small">Version <span class="v-version"></span>. Operated by <b class="v-operator"></b>
+        (contact: <a class="v-contact"></a>).</p>
+
+      <p>FresherPilot is a private, invite-only job-search assistant. This policy explains what personal data it
+        stores, why, who it is shared with, and your rights under India's Digital Personal Data Protection Act, 2023
+        (DPDP Act). "We" means the operator named above; "you" means a member with an account.</p>
+
+      <h2>1. What we collect and why</h2>
+      <table>
+        <tr><th>Data</th><th>Why (purpose)</th></tr>
+        <tr><td>Account: username, email and Google account ID (if you use Google sign-in), a salted password hash
+          (if you use a password), when you accepted these terms</td><td>To sign you in and keep your data separate from other members</td></tr>
+        <tr><td>Profile and resume: name, contact details, education, skills, experience, the answers you save for
+          application forms, your resume file</td><td>To match jobs to you, fill application forms and write messages <b>when you ask it to</b></td></tr>
+        <tr><td>Your API keys (Groq, Apify, Gmail app password, Serper)</td><td>To run the services you connect, with your own accounts. Stored encrypted; never shown to anyone, including the operator, in readable form through the app</td></tr>
+        <tr><td>Job-search data: job listings found for you, AI results, jobs you opened, applications you tracked,
+          messages you sent and their log</td><td>To show your job list, dashboard and history</td></tr>
+        <tr><td>Session cookie and the browser extension's token</td><td>To keep you signed in (essential; no tracking or advertising cookies)</td></tr>
+        <tr><td>Basic request data (IP address in short-lived memory for sign-in rate limiting)</td><td>Security: to block password guessing</td></tr>
+      </table>
+      <p>We do not sell your data, use it for advertising, or build profiles of you for anyone else.</p>
+
+      <h2>2. Data about other people (recruiters and companies)</h2>
+      <p>To help you reach out, the app looks up <b>publicly available</b> business contact details of recruiters
+        and companies (for example from company websites and public search results) and keeps them in a shared cache.
+        It only uses information that was made public for professional contact. Anyone whose details appear can ask us
+        to remove them using the contact above, and we will delete them and stop collecting them.</p>
+
+      <h2>3. Who data is shared with (processors)</h2>
+      <p>Only what each step needs is sent, and only when that feature runs:</p>
+      <ul>
+        <li><b>Groq</b> (AI): job descriptions and a summary of your profile/skills, to judge fit and draft answers or messages.</li>
+        <li><b>Apify</b> (with your key): search keywords and cities, to fetch job listings.</li>
+        <li><b>Google</b>: sign-in (Google Identity Services); Gmail, if you connect your own Gmail to send emails you approve.</li>
+        <li><b>Serper / DuckDuckGo</b>: company names, to find public contact pages.</li>
+        <li><b>Cloudflare</b>: carries the encrypted connection between your browser and this app.</li>
+        <li><b>Job sites and employers</b>: when <i>you</i> apply or send a message, the details you choose are sent to them.</li>
+      </ul>
+      <p>These providers have their own privacy policies. Some process data outside India.</p>
+
+      <h2>4. Where it is stored and how it is protected</h2>
+      <p>Data is stored on the operator's computer in India, in a separate folder per member. Passwords are stored
+        only as salted hashes; API keys are encrypted; the connection is HTTPS through Cloudflare; the app is
+        reachable only through that tunnel. No system is perfectly secure: if a breach affects your data, we will tell
+        you and the Data Protection Board of India as the law requires.</p>
+
+      <h2>5. How long we keep it</h2>
+      <p>Account, profile and history: until you delete your account (or the operator removes it). Job listings are
+        dropped automatically after 3 weeks. Deleting your account removes your folder at once; the app keeps no
+        separate copies.</p>
+
+      <h2>6. Your rights</h2>
+      <ul>
+        <li><b>Access:</b> Settings → "Download my data" gives you everything stored for your account.</li>
+        <li><b>Correction:</b> edit your profile, resume and settings in the app at any time.</li>
+        <li><b>Erasure / withdraw consent:</b> Settings → "Delete my account" deletes your account and data at once.</li>
+        <li><b>Grievance:</b> write to <a class="v-contact"></a>. We aim to reply within 7 days and resolve within
+          30 days. If you are not satisfied, you can complain to the Data Protection Board of India.</li>
+        <li><b>Nominate:</b> you may name a person to exercise these rights for you in case of death or incapacity, by writing to us.</li>
+      </ul>
+
+      <h2>7. Age</h2>
+      <p>FresherPilot is only for people aged 18 or older.</p>
+
+      <h2>8. Changes</h2>
+      <p>If this policy changes in a meaningful way, the version above changes and the app asks you to accept it again.</p>
+    </main>
+    <script src="/static/legal.js"></script>
+  </body>
+</html>

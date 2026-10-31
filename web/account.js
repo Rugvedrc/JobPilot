@@ -1,6 +1,6 @@
 // Shared by the onboarding and account pages: API keys.
 const $ = (id) => document.getElementById(id);
-const KEY_FIELDS = ["GROQ_API_KEY", "APIFY_API_KEY", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD"];
+const KEY_FIELDS = ["GROQ_API_KEY", "NVIDIA_API_KEY", "APIFY_API_KEY", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD"];
 
 function msg(id, text, bad = false) {
   const el = $(id);

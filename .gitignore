@@ -41,3 +41,6 @@ venv/
 Thumbs.db
 .autoapply-browser/
 .claude/
+
+# Google OAuth client secret downloads
+client_secret*.json

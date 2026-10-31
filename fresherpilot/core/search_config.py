@@ -34,7 +34,7 @@ NAUKRI = {
     "actor": "blackfalcondata/naukri-jobs-feed",
     "input": {
         "searchQueries": ROLES,
-        "experience": "0",          # jobs whose range includes 0 years
+        "experience": "0",          # jobs whose range includes 0 years (see NAUKRI_EXPERIENCE_PASSES)
         "departmentIds": ["5", "3"],
         "freshness": POSTED_WITHIN_DAYS,
         "sortBy": "date",
@@ -47,6 +47,13 @@ NAUKRI = {
     },
     "max_charge_usd": 0.6,
 }
+# Naukri's experience filter takes one value: "0" = ranges that include 0 years, which never returns
+# "1-3 years" jobs (that's how a Data Scientist call like Vividnex's was missed). A second pass with "1"
+# brings those in. Measured (Oct 2026): experienceMin/experienceMax only apply the minimum, so there is
+# no single-run way; each pass keeps its own "only new jobs" state (a shared one isn't shared across
+# experience values and could be overwritten). Jobs in both passes (e.g. "0-2 years") are paid twice
+# ($0.00039 each), about +50% on the second pass. 1-year jobs are shown as "stretch" jobs.
+NAUKRI_EXPERIENCE_PASSES = ["0", "1"]
 
 # LinkedIn search links posted in the last 3 days (f_TPR in seconds; the actor's own time filter only
 # offers 1, 7 or 30 days) and full-time only (f_JT=F). Tested: LinkedIn's entry-level filter (f_E) makes
@@ -127,6 +134,19 @@ WELLFOUND = {
 }
 
 
+# Google Jobs (litescrape/google-jobs, $0.25 per 1,000 searches, no start fee): a catch-all that finds
+# jobs on sites we don't search (Glassdoor, Shine, company career sites...). Results have no full
+# description. Apify's free plan allows 25 searches/day for this actor, so: one search per role,
+# at most GOOGLE_RUNS_PER_DAY fetches a day, GOOGLE_MIN_GAP_HOURS apart.
+GOOGLE_JOBS = {
+    "actor": "litescrape/google-jobs",
+    "input": {"gl": "in", "hl": "en", "maxPagesPerInput": 1, "maxConcurrency": 2, "datasetOutput": True},
+    "max_charge_usd": 0.02,
+}
+GOOGLE_RUNS_PER_DAY = 2
+GOOGLE_MIN_GAP_HOURS = 6
+
+
 # Internshala's full-time "fresher jobs" section (not internships). Incremental mode: after the first
 # run only new / updated listings are returned (and charged, ~$0.0004 each).
 INTERNSHALA = {
@@ -152,14 +172,36 @@ INTERNSHALA = {
 # Each board gets a share; every search is sorted newest first, so a board that reaches its share
 # has already kept the newest jobs. Full coverage of all boards costs roughly $1/day.
 APIFY_USD_PER_DAY: float | None = None
-BUDGET_SHARE = {"linkedin": 0.45, "naukri": 0.25, "indeed": 0.12, "internshala": 0.10, "wellfound": 0.08}
+# LinkedIn and Indeed are fetched free first (free_boards.py) and use Apify only if that fails, so
+# Naukri (no free source) gets most of the credit.
+# Live poller (jobs/live_poller.py): these boards are read free, all the time, in the background,
+# instead of in the scheduled fetch. LinkedIn takes turns through every title x city search (~1
+# request / 2.5 s, so a new post shows up in 1-2 minutes); the others every LIVE_EVERY_MIN minutes.
+LIVE_POLLER = True
+LIVE_BOARDS = {"linkedin", "indeed", "internshala", "wellfound"}
+LIVE_EVERY_MIN = {"indeed": 20, "internshala": 30, "wellfound": 60}
+LIVE_CHECK_MIN = 3  # new jobs wait at most this long (or until 10 pile up) before the AI check runs
+# Boards that may use Apify credit ($5/month). Naukri has no free route that works without a browser
+# (the extension sweep is the free backup). Add "google", "internshala", ... here to turn them back on.
+APIFY_BOARDS = {"naukri"}
+SCHEDULED_FETCH_HOURS = 2  # the regular fetch (Naukri, career pages, Telegram) runs this often
+# LinkedIn free only: searches the free route can't finish (rate limit / time) run first on the next
+# fetch instead of going to Apify. Set False to let Apify finish them (costs credit).
+LINKEDIN_FREE_ONLY = True
+LINKEDIN_FREE_MINUTES = 25  # time per fetch for the free LinkedIn search (~1 request / 2.5 s)
+BUDGET_SHARE = {"naukri": 0.95, "internshala": 0.12, "wellfound": 0.08, "linkedin": 0.10, "indeed": 0.05, "google": 0.02}
 MIN_RUN_USD = 0.02
 
 # ---------------------------------------------------------------- company career pages (free)
 # Public job boards of companies (Greenhouse / Lever / Ashby). Only India-based openings are used.
-# Add a company: ("greenhouse" | "lever" | "ashby", "<board name in its jobs URL>", "<Company>").
+# Add a company: ("greenhouse" | "lever" | "ashby" | "smartrecruiters", "<board name in its jobs URL>", "<Company>").
 # e.g. jobs.lever.co/cred -> ("lever", "cred", "CRED"); jobs.ashbyhq.com/sarvam -> ("ashby", "sarvam", "Sarvam AI")
 CAREERS = {"runner": "careers"}
+
+# Public Telegram job channels (free, read from the t.me/s/<channel> web preview). Each user lists
+# their own in Settings; private channels can't be read this way.
+TELEGRAM = {"runner": "telegram"}
+TELEGRAM_FIRST_DAYS = 3
 CAREERS_FIRST_DAYS = 21  # the first fetch takes openings from the last 3 weeks; later fetches only new ones
 CAREER_PAGES = [
     # AI-first
@@ -201,6 +243,15 @@ CAREER_PAGES = [
     ("greenhouse", "twilio", "Twilio"),
     ("greenhouse", "figma", "Figma"),
     ("ashby", "notion", "Notion"),
+    # SmartRecruiters (official Posting API; e.g. jobs.smartrecruiters.com/BoschGroup -> "BoschGroup")
+    ("smartrecruiters", "BoschGroup", "Bosch"),
+    ("smartrecruiters", "ServiceNow", "ServiceNow"),
+    ("smartrecruiters", "NielsenIQ", "NielsenIQ"),
+    ("smartrecruiters", "Freshworks", "Freshworks"),
+    ("smartrecruiters", "Experian", "Experian"),
+    ("smartrecruiters", "Continental", "Continental"),
+    ("smartrecruiters", "WesternDigital", "Western Digital"),
+    ("smartrecruiters", "Ubisoft2", "Ubisoft"),
 ]
 
 
@@ -226,6 +277,8 @@ DEFAULT_PREFS = {
     # Cities to search (e.g. ["Pune", "Bangalore", "Remote"]). Empty = all of India. Sent to every
     # board's search, so Apify only returns (and charges for) jobs there; "Remote" adds remote jobs.
     "locations": [],
+    # Public Telegram channels with job posts (names or t.me links), e.g. ["FreshersJobsUpdates"].
+    "telegram_channels": [],
 }
 
 # Other spellings of a city, used when checking a job's location text.

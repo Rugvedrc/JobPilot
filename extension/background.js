@@ -12,6 +12,26 @@ async function serverUrl() {
   return (server || DEFAULT_SERVER).replace(/\/+$/, "");
 }
 
+// The app-page bridge (bridge.js) is built in for localhost. For the app at another address (e.g.
+// your Cloudflare Tunnel URL, set in the popup) it is registered for that address here.
+async function syncBridge() {
+  let u;
+  try {
+    u = new URL(await serverUrl());
+  } catch {
+    return;
+  }
+  await chrome.scripting.unregisterContentScripts({ ids: ["jf-bridge-remote"] }).catch(() => {});
+  if (/^(localhost|127\.0\.0\.1)$/.test(u.hostname)) return;
+  await chrome.scripting
+    .registerContentScripts([{ id: "jf-bridge-remote", matches: [`${u.protocol}//${u.hostname}/*`], js: ["bridge.js"],
+      runAt: "document_start", persistAcrossSessions: true }])
+    .catch((e) => console.warn("FresherPilot bridge:", e));
+}
+chrome.runtime.onInstalled.addListener(syncBridge);
+chrome.runtime.onStartup.addListener(syncBridge);
+chrome.storage.onChanged.addListener((changes) => { if (changes.server) syncBridge(); });
+
 async function authHeader() {
   const { token } = await chrome.storage.local.get("token");
   return token ? { "X-JF-Token": token } : {};
@@ -37,7 +57,7 @@ async function authFetch(path, options = {}) {
     throw new Error(`Can't reach the FresherPilot app at ${await serverUrl()}. Start it with python main.py.`);
   }
   if (res.status === 401 && (await refreshToken())) res = await go();
-  if (res.status === 401) throw new Error("Sign in to the FresherPilot app (open http://localhost:8000 and log in), then try again.");
+  if (res.status === 401) throw new Error(`Sign in to the FresherPilot app (open ${await serverUrl()} and log in), then try again.`);
   return res;
 }
 
@@ -413,6 +433,102 @@ async function runWhatsApp({ items, gap }) {
   return { ok: true, count: items.length };
 }
 
+// ---------------------------------------------------------------- Naukri sweep
+// Naukri has no free API, so the app's Naukri coverage comes from here when Apify credit runs out:
+// open the user's Naukri searches in one background tab of this browser (a normal page visit, at a
+// human pace), read the job cards on each results page and send them to the app.
+
+let naukriRunning = false;
+
+// Runs inside the Naukri results page.
+function readNaukriCards() {
+  const out = [];
+  const seen = new Set();
+  const pick = (el, sels) => {
+    for (const s of sels) {
+      const x = el.querySelector(s);
+      if (x && x.textContent.trim()) return x.textContent.trim();
+    }
+    return "";
+  };
+  let cards = [...document.querySelectorAll(".srp-jobtuple-wrapper, article.jobTuple, .cust-job-tuple")];
+  if (!cards.length) cards = [...document.querySelectorAll('a[href*="/job-listings-"]')].map((a) => a.closest("article, li, div") || a);
+  for (const c of cards) {
+    const a = c.matches && c.matches('a[href*="/job-listings-"]') ? c : c.querySelector('a.title, a[href*="/job-listings-"]');
+    if (!a) continue;
+    const url = a.href.split("?")[0];
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({
+      id: c.getAttribute && (c.getAttribute("data-job-id") || ""),
+      title: (a.getAttribute("title") || a.textContent || "").trim(),
+      url,
+      company: pick(c, ["a.comp-name", ".comp-name", ".companyInfo a", "[class*='comp-name']"]),
+      experience: pick(c, [".expwdth", ".exp-wrap", ".experience", "[class*='exp-wrap']"]),
+      location: pick(c, [".locWdth", ".loc-wrap", ".location", "[class*='loc-wrap']"]),
+      salary: pick(c, [".sal-wrap", ".salary", "[class*='sal-wrap']"]),
+      posted: pick(c, [".job-post-day", "[class*='post-day']"]),
+      description: pick(c, [".job-desc", ".job-description", "[class*='job-desc']"]),
+      skills: [...c.querySelectorAll(".tags-gt li, ul.tags li")].map((li) => li.textContent.trim()).filter(Boolean),
+    });
+  }
+  const head = `${document.title} ${(document.body?.innerText || "").slice(0, 600)}`;
+  return {
+    jobs: out,
+    blocked: /captcha|access denied|are you a robot|unusual traffic/i.test(head),
+    empty: /no (matching )?jobs? found|didn.t find any jobs/i.test((document.body?.innerText || "").slice(0, 4000)),
+  };
+}
+
+async function readNaukriPage(tabId, url) {
+  await chrome.tabs.update(tabId, { url });
+  await waitForLoad(tabId, 30000).catch(() => null);
+  for (let i = 0; i < 20; i++) { // the results render after the page loads
+    await sleep(1000);
+    const r = await inTab(tabId, readNaukriCards).catch(() => null);
+    if (r && (r.jobs.length || r.blocked || r.empty)) return r;
+  }
+  return { jobs: [], blocked: false, empty: true };
+}
+
+async function runNaukriSweep() {
+  if (naukriRunning) return { ok: true, already: true };
+  const plan = await api("/api/naukri/sweep");
+  naukriRunning = true;
+  (async () => {
+    let tabId = null;
+    const total = { pages: 0, read: 0, added: 0 };
+    try {
+      tabId = (await chrome.tabs.create({ url: "about:blank", active: false })).id;
+      for (const base of plan.urls) {
+        let lastIds = "";
+        for (let page = 1; page <= (plan.max_pages || 5); page++) {
+          const url = page === 1 ? base : base.replace(/-jobs\?/, `-jobs-${page}?`);
+          const r = await readNaukriPage(tabId, url);
+          total.pages++;
+          if (r.blocked) throw new Error("Naukri showed a check page; open naukri.com once in this browser, then fetch again");
+          const ids = r.jobs.map((j) => j.url).join("|");
+          if (!r.jobs.length || ids === lastIds) break; // past the last page
+          lastIds = ids;
+          total.read += r.jobs.length;
+          const res = await api("/api/import_jobs", { method: "POST", body: JSON.stringify({ kind: "naukri", jobs: r.jobs }) }).catch(() => null);
+          total.added += res?.added || 0;
+          if (r.jobs.length < 15) break; // last page
+          await sleep(rand(plan.gap_seconds || [4, 8]));
+        }
+        await sleep(rand(plan.gap_seconds || [4, 8]));
+      }
+      await chrome.storage.local.set({ naukriSweep: { at: Date.now(), ...total, error: null } });
+    } catch (e) {
+      await chrome.storage.local.set({ naukriSweep: { at: Date.now(), ...total, error: String(e.message || e) } });
+    } finally {
+      if (tabId) chrome.tabs.remove(tabId).catch(() => {});
+      naukriRunning = false;
+    }
+  })();
+  return { ok: true, started: true, searches: plan.urls.length };
+}
+
 // ---------------------------------------------------------------- messages
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -438,7 +554,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.local.set({ token: msg.token });
         return { ok: true };
       case "jf-ping":
-        return { running, waRunning };
+        return { running, waRunning, naukriRunning, naukriSweep: (await chrome.storage.local.get("naukriSweep")).naukriSweep || null };
+      case "jf-naukri-sweep": // from the app page: read Naukri searches in this browser (free)
+        return runNaukriSweep();
       case "jf-whatsapp-send": // from the app page: [{uid, phone, text}]
         return runWhatsApp(msg);
       case "jf-command": // Continue / Skip / Stop from the panel in the job tab

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -20,7 +21,25 @@ from fresherpilot.jobs.ranker import strip_html
 
 INDIA = re.compile(r"\b(india|bengaluru|bangalore|hyderabad|pune|mumbai|navi mumbai|delhi|new delhi|ncr|gurugram|gurgaon|noida|"
                    r"chennai|kolkata|ahmedabad|kochi|jaipur|indore|coimbatore|chandigarh|trivandrum|thiruvananthapuram)\b", re.I)
-TIMEOUT = 25
+# (connect, read): big boards like Paytm's Lever feed are ~3 MB and can take a while to arrive.
+TIMEOUT = (10, 90)
+_session = requests.Session()
+_session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(
+    total=2, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))))
+
+
+def _get_json(url: str) -> Any:
+    """GET with retries; a read timeout is retried once more (slow boards often answer the 2nd time)."""
+    for attempt in range(2):
+        try:
+            r = _session.get(url, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt:
+                raise
+            time.sleep(3)
+    return None
 
 
 def _days_ago(dt: datetime | None) -> int | None:
@@ -54,7 +73,7 @@ def _job(company: str, jid: str, title: str, location: str, posted: datetime | N
 
 
 def _greenhouse(token: str, name: str) -> list[dict[str, Any]]:
-    data = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true", timeout=TIMEOUT).json()
+    data = _get_json(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true")
     out = []
     for j in data.get("jobs", []):
         loc = (j.get("location") or {}).get("name", "")
@@ -69,7 +88,7 @@ def _greenhouse(token: str, name: str) -> list[dict[str, Any]]:
 
 
 def _lever(token: str, name: str) -> list[dict[str, Any]]:
-    data = requests.get(f"https://api.lever.co/v0/postings/{token}?mode=json", timeout=TIMEOUT).json()
+    data = _get_json(f"https://api.lever.co/v0/postings/{token}?mode=json")
     out = []
     for j in data if isinstance(data, list) else []:
         cat = j.get("categories") or {}
@@ -87,7 +106,7 @@ def _lever(token: str, name: str) -> list[dict[str, Any]]:
 
 
 def _ashby(token: str, name: str) -> list[dict[str, Any]]:
-    data = requests.get(f"https://api.ashbyhq.com/posting-api/job-board/{token}", timeout=TIMEOUT).json()
+    data = _get_json(f"https://api.ashbyhq.com/posting-api/job-board/{token}")
     out = []
     for j in data.get("jobs", []):
         if j.get("isListed") is False:
@@ -102,7 +121,39 @@ def _ashby(token: str, name: str) -> list[dict[str, Any]]:
     return out
 
 
-BOARDS = {"greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby}
+def _smartrecruiters(token: str, name: str, since: datetime | None = None) -> list[dict[str, Any]]:
+    """SmartRecruiters public Posting API: India postings; full text only for new ones (one call each)."""
+    base = f"https://api.smartrecruiters.com/v1/companies/{token}/postings"
+    found, offset = [], 0
+    while True:
+        data = _get_json(f"{base}?country=in&limit=100&offset={offset}")
+        page = data.get("content") or []
+        found += page
+        offset += len(page)
+        if not page or offset >= (data.get("totalFound") or 0):
+            break
+    out = []
+    for j in found:
+        posted = _iso(j.get("releasedDate"))
+        if since and posted and posted < since:
+            continue
+        loc = j.get("location") or {}
+        place = ", ".join(x for x in (loc.get("city"), loc.get("region"), "Remote" if loc.get("remote") else "") if x) or "India"
+        detail = _get_json(f"{base}/{j['id']}") or {}
+        sections = ((detail.get("jobAd") or {}).get("sections")) or {}
+        desc = "\n".join(strip_html((sections.get(k) or {}).get("text") or "")
+                          for k in ("jobDescription", "qualifications", "additionalInformation"))
+        exp = (j.get("experienceLevel") or {}).get("label") or ""
+        url = detail.get("postingUrl") or f"https://jobs.smartrecruiters.com/{token}/{j['id']}"
+        job = _job(name, str(j["id"]), j.get("name", ""), place, posted, url, desc,
+                   (j.get("typeOfEmployment") or {}).get("label", ""), "sr")
+        if exp:
+            job["experience"] = exp
+        out.append(job)
+    return out
+
+
+BOARDS = {"greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby, "smartrecruiters": _smartrecruiters}
 
 
 def fetch(hours: float) -> tuple[list[dict[str, Any]], list[str]]:
@@ -113,12 +164,14 @@ def fetch(hours: float) -> tuple[list[dict[str, Any]], list[str]]:
     def one(entry: tuple[str, str, str]) -> list[dict[str, Any]]:
         board, token, name = entry
         try:
+            if board == "smartrecruiters":
+                return BOARDS[board](token, name, since)
             return BOARDS[board](token, name)
         except Exception as exc:  # noqa: BLE001 — one company failing never stops the rest
-            errors.append(f"{name}: {exc}")
+            errors.append(f"{name}: {type(exc).__name__}: {str(exc)[:120]}")
             return []
 
-    with ThreadPoolExecutor(max_workers=12) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         jobs = [j for batch in pool.map(one, cfg.CAREER_PAGES) for j in batch]
     fresh = [j for j in jobs if not j["posted"] or _iso(j["posted"]) >= since]
     return fresh, errors

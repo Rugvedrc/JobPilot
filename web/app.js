@@ -212,6 +212,8 @@ function fitChip(job) {
 }
 
 function yearsChip(job) {
+  if (job.ai_category === "stretch")
+    return `<span class="chip warn" title="${escapeHtml(job.ai_evidence || "Asks for about 1 year; freshers often still get calls")}">Stretch · asks 1 yr</span>`;
   if (job.ai_freshers) return `<span class="chip hit">Freshers welcome</span>`;
   if (job.ai_intern_credit) return `<span class="chip warn" title="${escapeHtml(job.ai_intern_credit)}">1 yr · internships count</span>`;
   if (typeof job.ai_years === "number") {
@@ -311,6 +313,14 @@ function renderList() {
   $("resultCount").textContent = `${shown.length} job${shown.length === 1 ? "" : "s"}`;
   if (!jobs().length) {
     listEl.innerHTML = `<li class="empty">No jobs yet. Click <strong>Fetch new jobs</strong>.</li>`;
+    return;
+  }
+  const pending = jobs().filter((j) => j.status === "unchecked").length;
+  if (!shown.length && pending && !state.showUnchecked) {
+    listEl.innerHTML = `<li class="empty">${pending} job${pending === 1 ? " is" : "s are"} waiting for the AI check${
+      state.setupMissing ? ` (it starts once you <a href="/onboarding">finish setup</a>)` : ""}.<br>
+      <button type="button" class="btn small" id="showPendingBtn">Show them now</button></li>`;
+    $("showPendingBtn").onclick = () => { state.showUnchecked = true; savePrefs(); syncControls(); renderList(); };
     return;
   }
   listEl.innerHTML = shown.length
@@ -536,7 +546,8 @@ function render(data) {
   $("rejectedCount").title = reasons;
 
   const messages = Object.entries(data.errors || {}).map(([actor, msg]) => `${actor}: ${msg}`);
-  for (const e of [data.task?.fetch?.error, data.task?.check?.error]) if (e) messages.push(e);
+  // (the setup banner already says what's missing, so its AI-check message isn't repeated here)
+  for (const e of [data.task?.fetch?.error, state.setupMissing ? null : data.task?.check?.error]) if (e) messages.push(e);
   $("errors").hidden = !messages.length;
   $("errors").textContent = messages.join(" · ");
 
@@ -546,7 +557,10 @@ function render(data) {
     const cost = typeof r.cost_usd === "number" && r.cost_usd > 0.004 ? `$${r.cost_usd.toFixed(2)}` : r.free || r.cost_usd === 0 ? "free" : "";
     return `${src[0].toUpperCase() + src.slice(1)} ${cost} · ${r.new} new` + (r.already_had ? `, ${r.already_had} seen before` : "") + (r.duplicates ? `, ${r.duplicates} duplicates` : "");
   });
-  if ((data.skipped_sources || []).length) parts.push(`${data.skipped_sources.join(", ")} skipped (already fetched today; it charges per run)`);
+  const live = data.task?.live?.boards || {};
+  const liveParts = Object.entries(live).map(([b, r]) => `${BOARD_NAMES[b] || b} free · ${r.added || 0} new`);
+  if (liveParts.length) parts.unshift(...liveParts);
+  if ((data.no_apify_credit || []).length) parts.push(`${data.no_apify_credit.join(", ")} skipped (no Apify key or no credit left today)`);
   $("fetchReport").textContent = parts.length ? `Last fetch: ${parts.join(" | ")}` : "";
 
   renderSources();
@@ -592,13 +606,26 @@ async function setVisited(uids, value) {
 let polling = false;
 
 // Fetching and the AI check are independent; each has its own progress text.
-function describeFetch(f) {
-  if (!f || !f.running) return "";
-  const mins = f.started ? Math.floor((Date.now() / 1000 - f.started) / 60) : 0;
-  const waiting = (f.waiting || []).join(", ");
-  return f.total
-    ? `Fetching: ${f.done}/${f.total} boards done${waiting ? ` (waiting for ${waiting})` : ""}, ${mins} min`
-    : "Starting the job board scrapers…";
+const BOARD_NAMES = { linkedin: "LinkedIn", indeed: "Indeed", internshala: "Internshala", wellfound: "Wellfound" };
+
+// Live boards (read all the time; the Fetch button starts a full round) + the regular fetch.
+function liveBusy(st) {
+  const live = st?.live || {};
+  return (live.busy || []).map((b) => {
+    const r = b === "linkedin" && live.linkedin_round;
+    return r ? `LinkedIn ${r.done}/${r.total} searches` : BOARD_NAMES[b] || b;
+  });
+}
+
+function describeFetch(st) {
+  const f = st?.fetch;
+  const parts = [];
+  if (f?.running) {
+    const waiting = (f.waiting || []).join(", ");
+    parts.push(f.total ? `${f.done}/${f.total} boards done${waiting ? ` (waiting for ${waiting})` : ""}` : "starting…");
+  }
+  parts.push(...liveBusy(st));
+  return parts.length ? `Fetching: ${parts.join(" · ")}` : "";
 }
 
 function describeCheck(c) {
@@ -609,7 +636,7 @@ function describeCheck(c) {
 }
 
 function showProgress(st) {
-  const busy = st.fetch?.running ? st.fetch : st.check?.running ? st.check : null;
+  const busy = st.fetch?.running ? st.fetch : liveBusy(st).length ? { total: 0 } : st.check?.running ? st.check : null;
   $("progress").hidden = !busy;
   if (!busy) return;
   const pct = busy.total ? (busy.done / busy.total) * 100 : null;
@@ -617,11 +644,11 @@ function showProgress(st) {
   $("progressFill").style.width = pct === null ? "" : `${pct}%`;
 }
 
-function setFetchButton(f) {
-  const busy = !!f?.running;
+function setFetchButton(st) {
+  const busy = !!(st?.fetch?.running || liveBusy(st).length);
   fetchBtn.classList.toggle("busy", busy);
   fetchBtn.setAttribute("aria-busy", busy ? "true" : "false");
-  fetchBtn.textContent = busy ? (f.total ? `Fetching… ${f.done}/${f.total} boards` : "Fetching…") : "Fetch new jobs";
+  fetchBtn.textContent = busy ? "Fetching…" : "Fetch new jobs";
 }
 
 let loadInFlight = null;
@@ -676,15 +703,16 @@ async function pollTask() {
         await sleep(4000);
         continue;
       }
-      setFetchButton(st.fetch);
+      setFetchButton(st);
       showProgress(st);
-      const parts = [describeFetch(st.fetch), describeCheck(st.check)].filter(Boolean);
+      const parts = [describeFetch(st), describeCheck(st.check)].filter(Boolean);
       if (parts.length) statusEl.textContent = parts.join(" · ");
       // New jobs after a fetch, and new AI results, show up in the list as they arrive.
-      const fetchJustEnded = wasFetching && !st.fetch?.running;
-      wasFetching = !!st.fetch?.running;
+      const fetching = !!(st.fetch?.running || liveBusy(st).length);
+      const fetchJustEnded = wasFetching && !fetching;
+      wasFetching = fetching;
       const progressed = st.check?.running && st.check.done !== lastDone;
-      if (fetchJustEnded || (progressed && Date.now() - lastRefresh > 6000)) {
+      if (fetchJustEnded || ((progressed || fetching) && Date.now() - lastRefresh > 8000)) {
         lastDone = st.check?.done ?? lastDone;
         lastRefresh = Date.now();
         loadJobs().catch(() => {});
@@ -811,7 +839,7 @@ $("sources").addEventListener("click", (e) => {
 
 fetchBtn.addEventListener("click", async () => {
   if (fetchBtn.classList.contains("busy")) return; // already fetching; progress is shown on the button
-  setFetchButton({ running: true, total: 0, done: 0 });
+  setFetchButton({ fetch: { running: true } });
   try {
     const res = await fetch("/api/fetch", { method: "POST" });
     if (!res.ok && res.status !== 409) {
@@ -819,9 +847,31 @@ fetchBtn.addEventListener("click", async () => {
       throw new Error(data.detail || "Fetch failed");
     }
     pollTask();
+    // Naukri has no free API: the extension reads your Naukri searches in a background tab (free).
+    if (hasExtension()) toExtension({ type: "jf-naukri-sweep" }).catch(() => {});
   } catch (err) {
     statusEl.textContent = err.message || "Fetch failed";
     setFetchButton(null);
+  }
+});
+
+$("missedBtn").addEventListener("click", async () => {
+  const url = (prompt("Paste the link of a job you found that isn't in the app:") || "").trim();
+  if (!url) return;
+  statusEl.textContent = "Checking that job…";
+  try {
+    const res = await fetch("/api/missed", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+    const r = await res.json();
+    if (!res.ok) throw new Error(r.detail || "Couldn't check that link");
+    const name = [r.title, r.company].filter(Boolean).join(" · ") || "That job";
+    const label = { keep: "it's in your list", reject: `it was filtered out (${CATEGORY_LABELS[r.category] || r.category || "not relevant"}${r.reason ? ": " + r.reason : ""})`, unchecked: "it's waiting for the AI check" };
+    alert(r.found ? `${name}: already fetched, ${label[r.status] || r.status}.`
+      : r.imported ? `${name}: this was MISSED (${r.source}). It's added now and will be AI-checked. Logged so the gap can be fixed.`
+      : `Couldn't read that page (${r.error || "unknown error"}). The miss is logged.`);
+    statusEl.textContent = "";
+    if (r.imported) { await loadJobs().catch(() => {}); pollTask(); }
+  } catch (e) {
+    statusEl.textContent = e.message;
   }
 });
 
@@ -984,6 +1034,12 @@ setInterval(async () => {
 
 // Who is signed in; give the browser extension this user's token so it works for them.
 fetch("/api/me").then((r) => r.json()).then((me) => {
+  const setup = me.setup || {};
+  const missing = [!setup.ai_key && "an AI key (Groq, free)", !setup.resume && "your resume"].filter(Boolean);
+  state.setupMissing = missing.length > 0;
+  $("setupBanner").hidden = !missing.length;
+  if (missing.length) $("setupText").textContent = `Add ${missing.join(" and ")} so the app can check which jobs fit you.`;
+  if (me.prefs?.target_area) $("tagline").textContent = `${me.prefs.target_area}, matched to your resume`;
   if (me.user) $("userBtn").textContent = `${me.user.username} · Settings`;
   if (me.extension_token && hasExtension()) toExtension({ type: "jf-set-token", token: me.extension_token }).catch(() => {});
 }).catch(() => {});
